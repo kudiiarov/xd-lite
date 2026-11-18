@@ -165,7 +165,7 @@ anchor:
 }
 ```
 
-Репо = текущий воркспейс. Рецепт хука — [`hooks/xd-lite-push-guard.mjs`](hooks/xd-lite-push-guard.mjs).
+Репо = текущий воркспейс; если воркспейс без репо (или нужен другой) — передавай параметр `repo` (абсолютный путь) в вызовах тулов. Рецепт хука — [`hooks/xd-lite-push-guard.mjs`](hooks/xd-lite-push-guard.mjs).
 
 ## Разработка
 

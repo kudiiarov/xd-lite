@@ -1,6 +1,6 @@
 {
   "name": "xd-lite",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "XD Lite — single-file, zero-dependency AI review viewer: diff + Task/Comment threads + a push-blocking hook contract for coding agents + MCP server",
   "type": "module",
   "license": "MIT",

@@ -2416,6 +2416,17 @@ function openBrowser(url) {
 //   xd-lite mcp [path]     (path defaults to the process cwd)
 // ============================================================================
 
+/** Injected into every tool: target another repo without restarting the server. */
+const MCP_REPO_PARAM = {
+  repo: {
+    type: 'string',
+    description:
+      'Absolute path to the target git repository. Optional: defaults to the workspace ' +
+      '(ZCODE_PROJECT_DIR/CLAUDE_PROJECT_DIR env) or the server cwd. Pass it explicitly ' +
+      'when the workspace is not the repo you want to review.',
+  },
+};
+
 const MCP_TOOLS = [
   {
     name: 'get_diff',
@@ -2486,46 +2497,81 @@ const MCP_TOOLS = [
   },
 ];
 
-async function runMcp({ repoPath, source, author }) {
-  const store = createLiteStore(repoPath);
-  await store.ensureExcluded();
+async function runMcp({ repoPath = null, source, author }) {
+  // The server must start even when the cwd is not a git repository (ZCode
+  // launches it with its workspace dir, which may be project-less). The repo
+  // is resolved per tool call: explicit `repo` arg → env → server arg → cwd.
+  const envRepo = [process.env.ZCODE_PROJECT_DIR, process.env.CLAUDE_PROJECT_DIR, process.env.XD_LITE_REPO].find(
+    (v) => v && v.length > 0
+  );
+  const storeCache = new Map();
+  async function resolveRepo(a = {}) {
+    const candidate = a.repo ?? repoPath ?? envRepo ?? process.cwd();
+    let root = null;
+    try {
+      root = await runGit(candidate, ['rev-parse', '--show-toplevel']);
+    } catch {}
+    if (!root) {
+      throw new Error(
+        `Not a git repository: ${candidate}. Pass the "repo" parameter (absolute path to the repo) ` +
+          `or open that repo as the workspace.`
+      );
+    }
+    if (!storeCache.has(root)) storeCache.set(root, createLiteStore(root));
+    return { root, store: storeCache.get(root) };
+  }
 
   const handlers = {
     get_diff: async (a = {}) => {
+      const { root } = await resolveRepo(a);
       const src =
         a.source === 'staged' ? { kind: 'staged' } : a.source === 'head' ? { kind: 'head' } : { kind: 'working' };
-      const text = (await getDiffText(repoPath, src)) || '(no changes)';
+      const text = (await getDiffText(root, src)) || '(no changes)';
       return { content: [{ type: 'text', text }] };
     },
     list_threads: async (a = {}) => {
+      const { root, store } = await resolveRepo(a);
+      await store.ensureExcluded();
       const st = a.status ?? 'all';
       const list = (await store.list()).filter((t) => st === 'all' || t.status === st);
       return { content: [{ type: 'text', text: list.length ? JSON.stringify(list, null, 2) : '(no threads)' }] };
     },
     get_thread: async (a = {}) => {
-      const raw = await readFile(threadPath(repoPath, String(a.id)), 'utf8');
+      const { root } = await resolveRepo(a);
+      const raw = await readFile(threadPath(root, String(a.id)), 'utf8');
       const thread = parseThread(raw, path.basename(String(a.id)));
       return { content: [{ type: 'text', text: JSON.stringify(thread, null, 2) }] };
     },
     add_comment: async (a = {}) => {
+      const { store } = await resolveRepo(a);
       const thread = await store.create({ ...a, side: a.side, author: a.author || author });
       return {
         content: [
-          { type: 'text', text: `Created ${thread.category} thread ${thread.id} on ${thread.file}:${thread.anchor.lines[0]}.\n` +
-            `The human sees it in the XD Lite review window; resolve via resolve_thread when done.` },
+          {
+            type: 'text',
+            text:
+              `Created ${thread.category} thread ${thread.id} on ${thread.file}:${thread.anchor.lines[0]}.\n` +
+              `The human sees it in the XD Lite review window; resolve via resolve_thread when done.`,
+          },
         ],
       };
     },
     reply_thread: async (a = {}) => {
+      const { store } = await resolveRepo(a);
       const thread = await store.reply(String(a.id), { body: a.body, author: a.author || 'agent:mcp' });
       return { content: [{ type: 'text', text: `Reply added to thread ${thread.id}.` }] };
     },
     resolve_thread: async (a = {}) => {
+      const { store } = await resolveRepo(a);
       const thread = await store.setStatus(String(a.id), a.status ?? 'resolved', a.actor || 'agent:mcp');
       return {
         content: [
-          { type: 'text', text: `Thread ${thread.id} is now ${thread.status}.` +
-            (thread.status === 'resolved' ? ' The Task checkbox in the review window is ticked.' : '') },
+          {
+            type: 'text',
+            text:
+              `Thread ${thread.id} is now ${thread.status}.` +
+              (thread.status === 'resolved' ? ' The Task checkbox in the review window is ticked.' : ''),
+          },
         ],
       };
     },
@@ -2553,7 +2599,11 @@ async function runMcp({ repoPath, source, author }) {
         },
       });
     } else if (msg.method === 'tools/list') {
-      send({ jsonrpc: '2.0', id: msg.id, result: { tools: MCP_TOOLS } });
+      const tools = MCP_TOOLS.map((t) => ({
+        ...t,
+        inputSchema: { ...t.inputSchema, properties: { ...(t.inputSchema?.properties ?? {}), ...MCP_REPO_PARAM } },
+      }));
+      send({ jsonrpc: '2.0', id: msg.id, result: { tools } });
     } else if (msg.method === 'tools/call') {
       const { name, arguments: args } = msg.params ?? {};
       const handler = handlers[name];
@@ -2596,15 +2646,16 @@ async function main() {
 
   const repoArg = positionals[0] ?? process.cwd();
 
-  // MCP stdio server for coding agents (no http server, no browser)
+  // MCP stdio server for coding agents (no http server, no browser).
+  // Starts even outside a git repository — tools resolve the repo per call
+  // (repo arg / env / cwd), so a project-less workspace still gets the tools.
   if (repoArg === 'mcp') {
     const mcpRepo = path.resolve(positionals[1] ?? process.cwd());
-    let mcpRoot;
+    let mcpRoot = null;
     try {
       mcpRoot = await runGit(mcpRepo, ['rev-parse', '--show-toplevel']);
     } catch {
-      console.error(`xd-lite mcp: ${mcpRepo} is not a git repository`);
-      process.exit(1);
+      console.error(`[xd-lite] cwd is not a git repository (${mcpRepo}) — pass "repo" in tool calls.`);
     }
     await runMcp({
       repoPath: mcpRoot,

@@ -389,6 +389,62 @@ test('mcp subcommand: stdio JSON-RPC serves tools end-to-end', async () => {
   assert.equal(code, 0);
 }, 30000);
 
+test('mcp server starts outside a git repo; tools accept an explicit repo param', async () => {
+  const dir = makeRepo();
+  const nowhere = mkdtempSync(path.join(tmpdir(), 'xd-mcp-norepo-'));
+  // isolate from ZCode/claude env vars so the repo chain really falls through to cwd
+  const env = { ...process.env, ZCODE_PROJECT_DIR: '', CLAUDE_PROJECT_DIR: '', XD_LITE_REPO: '' };
+  const child = spawn(process.execPath, [CLI, 'mcp'], { cwd: nowhere, env, stdio: ['pipe', 'pipe', 'pipe'] });
+  const responses = [];
+  let buf = '';
+  child.stdout.on('data', (c) => {
+    buf += c.toString();
+    let nl;
+    while ((nl = buf.indexOf('\n')) !== -1) {
+      responses.push(JSON.parse(buf.slice(0, nl)));
+      buf = buf.slice(nl + 1);
+    }
+  });
+  const send = (msg) => child.stdin.write(JSON.stringify(msg) + '\n');
+  let nextId = 0;
+  const call = (method, params) => {
+    const id = ++nextId;
+    send({ jsonrpc: '2.0', id, method, params });
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`no response for id ${id}`)), 10000);
+      const check = setInterval(() => {
+        const r = responses.find((r) => r.id === id);
+        if (r) { clearInterval(check); clearTimeout(timer); resolve(r); }
+      }, 25);
+    });
+  };
+  try {
+    const init = await call('initialize', { protocolVersion: '2024-11-05', capabilities: {} });
+    assert.equal(init.result.serverInfo.name, 'xd-lite', 'server starts even outside a git repo');
+
+    const tools = (await call('tools/list')).result.tools;
+    for (const t of tools) {
+      assert.ok(t.inputSchema.properties.repo, `repo param injected into ${t.name}`);
+    }
+
+    // without repo → clear isError (not a crash)
+    const noRepo = await call('tools/call', { name: 'get_diff', arguments: {} });
+    assert.equal(noRepo.result.isError, true);
+    assert.match(noRepo.result.content[0].text, /Not a git repository/);
+
+    // with explicit repo → works
+    const withRepo = await call('tools/call', {
+      name: 'get_diff',
+      arguments: { repo: dir },
+    });
+    assert.equal(withRepo.result.isError, undefined);
+    assert.match(withRepo.result.content[0].text, /changed two/);
+  } finally {
+    try { child.kill('SIGKILL'); } catch {}
+  }
+  // (the child is killed above; no exit-code assertion needed here)
+}, 30000);
+
 test('renderHandoff emits the REVIEW_FILE markdown contract', () => {
   const md = renderHandoff('/repo', [
     {
