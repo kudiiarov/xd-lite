@@ -1,0 +1,20 @@
+{
+  "name": "xd-lite",
+  "version": "0.1.0",
+  "description": "XD Lite — single-file, zero-dependency AI review viewer: diff + Task/Comment threads + a push-blocking hook contract for coding agents",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "xd-lite": "./xd-lite.js"
+  },
+  "files": [
+    "xd-lite.js",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test test/"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
