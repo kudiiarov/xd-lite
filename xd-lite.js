@@ -24,9 +24,10 @@
 
 import { spawn } from 'node:child_process';
 import { createServer as createHttpServer } from 'node:http';
+import { createInterface } from 'node:readline';
 import path from 'node:path';
 import { realpathSync } from 'node:fs';
-import { readFile, readdir, writeFile, mkdir, stat, unlink } from 'node:fs/promises';
+import { readFile, readdir, writeFile, mkdir, stat, unlink, appendFile } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
 
 // ============================================================================
@@ -37,6 +38,9 @@ const USAGE = `XD Lite — lightweight single-file review viewer
 
 Usage:
   xd-lite [path] [options]
+  xd-lite mcp [path]    MCP stdio server for coding agents
+                        (tools: get_diff, list_threads, get_thread,
+                         add_comment, reply_thread, resolve_thread)
 
 Options:
   --wait              block until "Send review to agent" is clicked, then
@@ -530,6 +534,21 @@ function createLiteStore(worktreePath) {
         thread.resolvedAt = undefined;
       }
       await writeFile(filePath, serializeThread(thread), 'utf8');
+      const currentSha = await fileBlobSha(worktreePath, thread.file);
+      return { ...thread, outdated: currentSha !== thread.anchor.blobSha };
+    },
+
+    /** Append an agent/human reply block (same shape as the core store). */
+    async reply(id, input) {
+      if (typeof input?.body !== 'string' || !input.body.trim()) {
+        throw Object.assign(new Error('empty body'), { statusCode: 400 });
+      }
+      const filePath = threadPath(worktreePath, id);
+      const author = (typeof input.author === 'string' && input.author.trim()) || 'agent:mcp';
+      const block = `\n---\nauthor: ${author}\nat: ${new Date().toISOString()}\n---\n\n${input.body.trim()}\n`;
+      await appendFile(filePath, block, 'utf8');
+      const raw = await readFile(filePath, 'utf8');
+      const thread = parseThread(raw, path.basename(id));
       const currentSha = await fileBlobSha(worktreePath, thread.file);
       return { ...thread, outdated: currentSha !== thread.anchor.blobSha };
     },
@@ -2391,6 +2410,176 @@ function openBrowser(url) {
 }
 
 // ============================================================================
+// MCP server — stdio, newline-delimited JSON-RPC 2.0, zero dependencies.
+// Lets coding agents read the diff and work with review threads as tools
+// (the same role the full XD's MCP server plays for the complete app).
+//   xd-lite mcp [path]     (path defaults to the process cwd)
+// ============================================================================
+
+const MCP_TOOLS = [
+  {
+    name: 'get_diff',
+    description:
+      'Unified diff of the repo (working tree by default, untracked files included). ' +
+      'Returns plain unified-diff text — parse it yourself.',
+    inputSchema: {
+      type: 'object',
+      properties: { source: { type: 'string', enum: ['working', 'staged', 'head'], description: 'default working' } },
+    },
+  },
+  {
+    name: 'list_threads',
+    description:
+      'Review threads as markdown-file records. category request-changes = Task (human wants it fixed), ' +
+      'comment = informational. Resolve a thread by setting its status via resolve_thread.',
+    inputSchema: {
+      type: 'object',
+      properties: { status: { type: 'string', enum: ['open', 'resolved', 'all'], description: 'default all' } },
+    },
+  },
+  {
+    name: 'get_thread',
+    description: 'One review thread with its replies.',
+    inputSchema: { type: 'object', required: ['id'], properties: { id: { type: 'string' } } },
+  },
+  {
+    name: 'add_comment',
+    description:
+      'Create a review thread on file lines (new-side numbering; side:"old" for removed lines). ' +
+      'category request-changes shows up as a Task for you in the review window.',
+    inputSchema: {
+      type: 'object',
+      required: ['file', 'lines', 'body'],
+      properties: {
+        file: { type: 'string', description: 'repo-relative path' },
+        lines: { type: 'array', items: { type: 'integer' }, minItems: 2, maxItems: 2, description: '[start, end]' },
+        side: { type: 'string', enum: ['old', 'new'] },
+        category: { type: 'string', enum: ['request-changes', 'comment'] },
+        body: { type: 'string' },
+        author: { type: 'string' },
+      },
+    },
+  },
+  {
+    name: 'reply_thread',
+    description: 'Append a reply to a review thread (what you did / answer).',
+    inputSchema: {
+      type: 'object',
+      required: ['id', 'body'],
+      properties: { id: { type: 'string' }, body: { type: 'string' }, author: { type: 'string' } },
+    },
+  },
+  {
+    name: 'resolve_thread',
+    description:
+      'Resolve (status resolved — ticks the Task checkbox) or reopen a thread. ' +
+      'Resolve only after the requested change is actually done.',
+    inputSchema: {
+      type: 'object',
+      required: ['id'],
+      properties: {
+        id: { type: 'string' },
+        status: { type: 'string', enum: ['resolved', 'open'], description: 'default resolved' },
+        actor: { type: 'string' },
+      },
+    },
+  },
+];
+
+async function runMcp({ repoPath, source, author }) {
+  const store = createLiteStore(repoPath);
+  await store.ensureExcluded();
+
+  const handlers = {
+    get_diff: async (a = {}) => {
+      const src =
+        a.source === 'staged' ? { kind: 'staged' } : a.source === 'head' ? { kind: 'head' } : { kind: 'working' };
+      const text = (await getDiffText(repoPath, src)) || '(no changes)';
+      return { content: [{ type: 'text', text }] };
+    },
+    list_threads: async (a = {}) => {
+      const st = a.status ?? 'all';
+      const list = (await store.list()).filter((t) => st === 'all' || t.status === st);
+      return { content: [{ type: 'text', text: list.length ? JSON.stringify(list, null, 2) : '(no threads)' }] };
+    },
+    get_thread: async (a = {}) => {
+      const raw = await readFile(threadPath(repoPath, String(a.id)), 'utf8');
+      const thread = parseThread(raw, path.basename(String(a.id)));
+      return { content: [{ type: 'text', text: JSON.stringify(thread, null, 2) }] };
+    },
+    add_comment: async (a = {}) => {
+      const thread = await store.create({ ...a, side: a.side, author: a.author || author });
+      return {
+        content: [
+          { type: 'text', text: `Created ${thread.category} thread ${thread.id} on ${thread.file}:${thread.anchor.lines[0]}.\n` +
+            `The human sees it in the XD Lite review window; resolve via resolve_thread when done.` },
+        ],
+      };
+    },
+    reply_thread: async (a = {}) => {
+      const thread = await store.reply(String(a.id), { body: a.body, author: a.author || 'agent:mcp' });
+      return { content: [{ type: 'text', text: `Reply added to thread ${thread.id}.` }] };
+    },
+    resolve_thread: async (a = {}) => {
+      const thread = await store.setStatus(String(a.id), a.status ?? 'resolved', a.actor || 'agent:mcp');
+      return {
+        content: [
+          { type: 'text', text: `Thread ${thread.id} is now ${thread.status}.` +
+            (thread.status === 'resolved' ? ' The Task checkbox in the review window is ticked.' : '') },
+        ],
+      };
+    },
+  };
+
+  const send = (msg) => process.stdout.write(JSON.stringify(msg) + '\n');
+  const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
+  for await (const line of rl) {
+    if (!line.trim()) continue;
+    let msg;
+    try {
+      msg = JSON.parse(line);
+    } catch {
+      continue; // tolerate garbage lines
+    }
+    if (!msg.id) continue; // notification (notifications/initialized etc.) — no response
+    if (msg.method === 'initialize') {
+      send({
+        jsonrpc: '2.0',
+        id: msg.id,
+        result: {
+          protocolVersion: msg.params?.protocolVersion ?? '2024-11-05',
+          capabilities: { tools: {} },
+          serverInfo: { name: 'xd-lite', title: 'XD Lite', version: '0.1.0' },
+        },
+      });
+    } else if (msg.method === 'tools/list') {
+      send({ jsonrpc: '2.0', id: msg.id, result: { tools: MCP_TOOLS } });
+    } else if (msg.method === 'tools/call') {
+      const { name, arguments: args } = msg.params ?? {};
+      const handler = handlers[name];
+      if (!handler) {
+        send({ jsonrpc: '2.0', id: msg.id, error: { code: -32602, message: `unknown tool: ${name}` } });
+        continue;
+      }
+      try {
+        send({ jsonrpc: '2.0', id: msg.id, result: await handler(args ?? {}) });
+      } catch (err) {
+        // tool errors are results with isError, not protocol errors
+        send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { content: [{ type: 'text', text: `Error: ${err.message}` }], isError: true },
+        });
+      }
+    } else if (msg.method === 'ping') {
+      send({ jsonrpc: '2.0', id: msg.id, result: {} });
+    } else {
+      send({ jsonrpc: '2.0', id: msg.id, error: { code: -32601, message: `method not found: ${msg.method}` } });
+    }
+  }
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -2406,6 +2595,24 @@ async function main() {
   }
 
   const repoArg = positionals[0] ?? process.cwd();
+
+  // MCP stdio server for coding agents (no http server, no browser)
+  if (repoArg === 'mcp') {
+    const mcpRepo = path.resolve(positionals[1] ?? process.cwd());
+    let mcpRoot;
+    try {
+      mcpRoot = await runGit(mcpRepo, ['rev-parse', '--show-toplevel']);
+    } catch {
+      console.error(`xd-lite mcp: ${mcpRepo} is not a git repository`);
+      process.exit(1);
+    }
+    await runMcp({
+      repoPath: mcpRoot,
+      author: (flags.get('--author') || '').trim() || undefined,
+    });
+    process.exit(0); // stdin closed — the client shut the server down
+  }
+
   const repoPath = path.resolve(repoArg);
 
   // resolve to the repo root up front; gives a clear error outside git repos

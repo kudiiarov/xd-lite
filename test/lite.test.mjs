@@ -318,6 +318,77 @@ test('task checkbox state round-trips through the shared thread format', { skip:
   assert.equal(viaCore.category, 'request-changes');
 });
 
+test('mcp subcommand: stdio JSON-RPC serves tools end-to-end', async () => {
+  const dir = makeRepo();
+  const child = spawn(process.execPath, [CLI, 'mcp'], { cwd: dir, stdio: ['pipe', 'pipe', 'pipe'] });
+  let errText = '';
+  child.stderr.on('data', (c) => { errText += c.toString(); });
+  const responses = [];
+  let buf = '';
+  child.stdout.on('data', (c) => {
+    buf += c.toString();
+    let nl;
+    while ((nl = buf.indexOf('\n')) !== -1) {
+      responses.push(JSON.parse(buf.slice(0, nl)));
+      buf = buf.slice(nl + 1);
+    }
+  });
+  const send = (msg) => child.stdin.write(JSON.stringify(msg) + '\n');
+  const waitFor = (id) =>
+    new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`no response for id ${id}; stderr: ${errText}`)), 10000);
+      const check = setInterval(() => {
+        const r = responses.find((r) => r.id === id);
+        if (r) { clearInterval(check); clearTimeout(timer); resolve(r); }
+      }, 25);
+    });
+
+  send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05', capabilities: {} } });
+  send({ jsonrpc: '2.0', method: 'notifications/initialized' }); // notification — no response
+  const init = await waitFor(1);
+  assert.equal(init.result.serverInfo.name, 'xd-lite');
+  assert.equal(init.result.protocolVersion, '2024-11-05');
+
+  send({ jsonrpc: '2.0', id: 2, method: 'tools/list' });
+  const tools = (await waitFor(2)).result.tools.map((t) => t.name);
+  assert.deepEqual(
+    [...tools].sort(),
+    ['add_comment', 'get_diff', 'get_thread', 'list_threads', 'reply_thread', 'resolve_thread']
+  );
+
+  send({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'get_diff', arguments: {} } });
+  const diffText = (await waitFor(3)).result.content[0].text;
+  assert.match(diffText, /changed two/);
+  assert.match(diffText, /new file mode 100644/, 'untracked file synthesized');
+
+  send({
+    jsonrpc: '2.0', id: 4, method: 'tools/call',
+    params: { name: 'add_comment', arguments: { file: 'a.txt', lines: [2, 3], category: 'request-changes', body: 'fix via mcp' } },
+  });
+  assert.match((await waitFor(4)).result.content[0].text, /Created request-changes thread/);
+
+  send({ jsonrpc: '2.0', id: 5, method: 'tools/call', params: { name: 'list_threads', arguments: { status: 'open' } } });
+  const list = (await waitFor(5)).result.content[0].text;
+  assert.match(list, /fix via mcp/);
+
+  const id5 = JSON.parse(list)[0].id;
+  send({
+    jsonrpc: '2.0', id: 6, method: 'tools/call',
+    params: { name: 'reply_thread', arguments: { id: id5, body: 'Fixed.', author: 'agent:test' } },
+  });
+  await waitFor(6);
+  send({
+    jsonrpc: '2.0', id: 7, method: 'tools/call',
+    params: { name: 'resolve_thread', arguments: { id: id5, actor: 'agent:test' } },
+  });
+  const resolved = (await waitFor(7)).result.content[0].text;
+  assert.match(resolved, /is now resolved/);
+
+  child.stdin.end();
+  const code = await new Promise((resolve) => child.on('close', resolve));
+  assert.equal(code, 0);
+}, 30000);
+
 test('renderHandoff emits the REVIEW_FILE markdown contract', () => {
   const md = renderHandoff('/repo', [
     {

@@ -149,6 +149,24 @@ anchor:
 блоком `--- / author: / at: / ---`. Больше возможностей (MCP-тулы, live-обновления,
 несколько worktree) — в полной версии XD.
 
+## MCP server для агентов
+
+`xd-lite mcp` — stdio MCP-сервер (zero-dep, JSON-RPC 2.0). Туулы: `get_diff`,
+`list_threads`, `get_thread`, `add_comment`, `reply_thread`, `resolve_thread`.
+Подключение (ZCode, юзер-скоуп `~/.zcode/cli/config.json`):
+
+```json
+{
+  "mcp": {
+    "servers": {
+      "xd-lite": { "type": "stdio", "command": "xd-lite", "args": ["mcp"] }
+    }
+  }
+}
+```
+
+Репо = текущий воркспейс. Рецепт хука — [`hooks/xd-lite-push-guard.mjs`](hooks/xd-lite-push-guard.mjs).
+
 ## Разработка
 
 ```bash
