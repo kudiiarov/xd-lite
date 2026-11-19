@@ -14,7 +14,11 @@ Full docs below (in Russian). Quick facts: `--wait` prints `REVIEW_FILE=<path>` 
 exits 0 after the human clicks "Send review to agent"; `--fail-on-open` exits 2 while
 open tasks remain (a PreToolUse hook can block `git push`); `--timeout MINUTES` stops
 the wait. Comments are stored as `<repo>/.xd/threads/*.md` — plain markdown, readable
-by humans, agents and MCP tools.
+by humans, agents and MCP tools. In the window (v0.1.4): a **diff-source switcher**
+in the header — working tree / staged / last commit / whole branch, plus every commit
+on the branch as its own diff; in-place **edit** of your remarks (✎); expand/collapse
+**all context** (⤢) and a compact split/unified icon toggle. Gitignored files are
+never shown.
 
 ---
 
@@ -27,6 +31,21 @@ xd-lite . --wait                       # хук: показать diff, собр
 xd-lite . --vs origin/main --wait      # «что уйдёт в push»
 xd-lite .                              # просто окно ревью (не блокируется)
 ```
+
+Что есть в окне (v0.1.4):
+
+- **Итерации контента** — селектор в шапке переключает дифф: working tree /
+  staged / последний коммит / весь бранч (vs base) + **каждый коммит ветки
+  отдельным диффом** (base — из `--vs`, иначе авто-детект: upstream →
+  `origin/main` → `main`). Выбор запоминается между перезагрузками.
+- **Замечания**: пилюля **Task/Comment** под строкой открывает композер сразу
+  с нужным типом; клик/shift-клик выбирает диапазон строк. У замечания есть
+  ✎ (править текст) и ✕ (удалить) до отправки ревью; ответы агента видны
+  в окне — с именем автора и визуально отделены от замечания.
+- **Контекст между ханками** — «⋯» раскрывает строки; кнопка `⤢` в тулбаре
+  файла раскрывает весь контекст сразу (повторный клик сворачивает).
+- **Split/Unified** — иконка-переключатель рядом с `⤢`; тема — кнопка в шапке.
+- Ignored-файлы (`.gitignore`) не показываются никогда.
 
 ## Как это работает (`--wait`)
 

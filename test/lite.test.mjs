@@ -5,13 +5,13 @@ import { mkdtempSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-// Cross-compat check: the full XD store must read what lite writes (and vice versa).
 // Cross-format check against the full XD store. In the XD monorepo @xd/core is
 // a workspace package (built by the test script); in this standalone repo it is
 // absent and the cross-format tests skip automatically.
 let ThreadStore = null;
 try { ({ ThreadStore } = await import('@xd/core')); } catch {}
 const hasCore = Boolean(ThreadStore);
+const coreSkip = hasCore ? false : '@xd/core not available (standalone checkout)';
 import {
   createLiteStore,
   getDiffText,
@@ -23,9 +23,8 @@ import {
   validateCreateInput,
 } from '../xd-lite.js';
 
-/** Isolated temp git repo with one commit, one modification and one untracked file. */
-function makeRepo() {
-  const dir = mkdtempSync(path.join(tmpdir(), 'xd-lite-test-'));
+/** Git runner bound to a temp repo (isolated config so tests never touch the user's git). */
+function gitIn(dir) {
   const gitconfig = path.join(dir, 'gitconfig');
   writeFileSync(
     gitconfig,
@@ -39,7 +38,13 @@ function makeRepo() {
     HOME: dir,
     USERPROFILE: dir,
   };
-  const git = (args) => execSync(`git ${args}`, { cwd: dir, env, stdio: 'pipe' });
+  return (args) => execSync(`git ${args}`, { cwd: dir, env, stdio: 'pipe' });
+}
+
+/** Isolated temp git repo with one commit, one modification and one untracked file. */
+function makeRepo() {
+  const dir = mkdtempSync(path.join(tmpdir(), 'xd-lite-test-'));
+  const git = gitIn(dir);
   git('init');
   writeFileSync(path.join(dir, 'a.txt'), 'line one\nline two\nline three\n');
   git('add .');
@@ -113,7 +118,7 @@ test('serialize/parse roundtrip keeps fields, hr-in-body and reply blocks', () =
   assert.equal(back.replies[0].body, 'Fine');
 });
 
-test('lite-created thread files are read by the full @xd/core store', { skip: hasCore ? false : '@xd/core not available (standalone checkout)' }, async () => {
+test('lite-created thread files are read by the full @xd/core store', { skip: coreSkip }, async () => {
   const dir = makeRepo();
   const store = createLiteStore(dir);
   await store.ensureExcluded();
@@ -150,7 +155,7 @@ test('lite-created thread files are read by the full @xd/core store', { skip: ha
   assert.equal(withReply.replies[0].body, 'Fixed in a follow-up');
 });
 
-test('lite server: health, diff, threads CRUD and handoff end-to-end', { skip: hasCore ? false : '@xd/core not available (standalone checkout)' }, async () => {
+test('lite server: health, diff, threads CRUD and handoff end-to-end', { skip: coreSkip }, async () => {
   const dir = makeRepo();
   const { url, port, waitForHandoff, close } = await startLiteServer({
     repoPath: dir,
@@ -254,7 +259,11 @@ test('lite server: health, diff, threads CRUD and handoff end-to-end', { skip: h
     assert.match(page, /tk-kw/, 'client css for syntax tokens is inlined');
     assert.match(page, /composer/, 'client js for the composer is inlined');
     assert.match(page, /data-file=/, 'file tree renderer inlined');
-    assert.match(page, /data-view="split"/, 'split-view toggle inlined');
+    assert.match(page, /viewToggle/, 'split/unified icon toggle inlined');
+    assert.match(page, /data-editstart/, 'thread edit button renderer inlined');
+    assert.match(page, /srcSel/, 'diff-source switcher inlined');
+    assert.match(page, /data-expandall/, 'expand-all-context button inlined');
+    assert.match(page, /data-quick/, 'hover quick-add pill inlined');
     assert.match(page, /data-task=/, 'task checkbox rendering inlined');
     assert.match(page, /data-sort/, 'comment sorting selector inlined');
     assert.match(page, /sideResize/, 'sidebar resize handle inlined');
@@ -265,7 +274,7 @@ test('lite server: health, diff, threads CRUD and handoff end-to-end', { skip: h
   }
 });
 
-test('old-side anchors: side round-trips in the format and the full store ignores it', { skip: hasCore ? false : '@xd/core not available (standalone checkout)' }, async () => {
+test('old-side anchors: side round-trips in the format and the full store ignores it', { skip: coreSkip }, async () => {
   const dir = makeRepo();
   const store = createLiteStore(dir);
   await store.ensureExcluded();
@@ -290,7 +299,7 @@ test('old-side anchors: side round-trips in the format and the full store ignore
   assert.doesNotMatch(raw2, /side:/);
 });
 
-test('task checkbox state round-trips through the shared thread format', { skip: hasCore ? false : '@xd/core not available (standalone checkout)' }, async () => {
+test('task checkbox state round-trips through the shared thread format', { skip: coreSkip }, async () => {
   const dir = makeRepo();
   const store = createLiteStore(dir);
   await store.ensureExcluded();
@@ -316,6 +325,108 @@ test('task checkbox state round-trips through the shared thread format', { skip:
   const viaCore = (await new ThreadStore(dir).list()).find((t) => t.id === task.id);
   assert.equal(viaCore.status, 'open');
   assert.equal(viaCore.category, 'request-changes');
+});
+
+test('updateBody edits the body, keeps replies and core compatibility', { skip: coreSkip }, async () => {
+  const dir = makeRepo();
+  const store = createLiteStore(dir);
+  await store.ensureExcluded();
+  const t = await store.create({ file: 'a.txt', lines: [1, 1], category: 'comment', body: 'original text' });
+  await store.reply(t.id, { author: 'agent:test', body: 'some answer' });
+
+  const updated = await store.updateBody(t.id, 'edited text\n');
+  assert.equal(updated.body, 'edited text');
+  assert.equal(updated.replies.length, 1, 'reply must survive the edit');
+  assert.equal(updated.replies[0].body, 'some answer');
+
+  const raw = readFileSync(path.join(dir, '.xd', 'threads', `${t.id}.md`), 'utf8');
+  assert.match(raw, /edited text/);
+  assert.doesNotMatch(raw, /original text/);
+  assert.match(raw, /author: agent:test/, 'reply block intact');
+
+  await assert.rejects(() => store.updateBody(t.id, '   '), /empty body/);
+
+  // the full @xd/core store reads the edited file fine
+  const viaCore = (await new ThreadStore(dir).list()).find((x) => x.id === t.id);
+  assert.equal(viaCore.body, 'edited text');
+  assert.equal(viaCore.replies.length, 1);
+});
+
+test('source switcher: /api/sources lists commits, ?src=commit:<sha> shows that commit, PATCH edits body', async () => {
+  const dir = makeRepo();
+  const git = gitIn(dir);
+  // commit the pending changes and add one more commit → branch history vs a base
+  git('add .');
+  git('commit -m "second: everything so far"');
+  writeFileSync(path.join(dir, 'a.txt'), 'line one\nchanged two\nline three\nline four\nline five\n');
+  git('commit -am "third: five"');
+
+  const { url, close } = await startLiteServer({
+    repoPath: dir,
+    port: 0,
+    source: { kind: 'vs', base: 'HEAD~2' },
+  });
+  try {
+    const src = await (await fetch(`${url}/api/sources`)).json();
+    assert.equal(src.current, 'vs:HEAD~2');
+    assert.equal(src.base, 'HEAD~2');
+    assert.ok(src.items.some((it) => it.key === 'vs:HEAD~2'), 'whole-branch entry present');
+    assert.equal(src.commits.length, 2, 'both branch commits listed');
+    assert.equal(src.commits[0].subject, 'third: five');
+    assert.equal(src.commits[1].subject, 'second: everything so far');
+    const third = src.commits[0].sha;
+    const second = src.commits[1].sha;
+
+    // each commit shows exactly its own diff
+    const d3 = await (await fetch(`${url}/api/diff?src=commit:${third}`)).json();
+    assert.equal(d3.label, `Commit ${third.slice(0, 7)}`);
+    assert.match(d3.text, /\+line five/);
+    assert.doesNotMatch(d3.text, /new\.py/, 'files untouched by this commit are absent');
+    assert.equal(d3.expandable, true, 'commit mode supports context expansion');
+
+    const d2 = await (await fetch(`${url}/api/diff?src=commit:${second}`)).json();
+    assert.match(d2.text, /new file mode 100644/);
+    assert.match(d2.text, /\+def greet/);
+    assert.doesNotMatch(d2.text, /line five/);
+
+    const dVs = await (await fetch(`${url}/api/diff?src=vs:HEAD~2`)).json();
+    assert.match(dVs.text, /new\.py/);
+    assert.match(dVs.text, /line five/, 'whole-branch diff combines all commits');
+
+    assert.equal((await fetch(`${url}/api/diff?src=bogus`)).status, 400);
+    assert.equal((await fetch(`${url}/api/diff?src=commit:zzzz`)).status, 400);
+
+    // context expansion works per commit: old side = parent blob
+    const blobOld = await (await fetch(`${url}/api/blob?path=a.txt&side=old&src=commit:${third}`)).json();
+    assert.match(blobOld.text, /changed two/);
+    assert.doesNotMatch(blobOld.text, /line five/, 'old side is the parent commit, not HEAD~2');
+
+    // PATCH { body } edits the remark through the HTTP API too
+    const created = await fetch(`${url}/api/threads`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ file: 'a.txt', lines: [2, 2], category: 'comment', body: 'before edit' }),
+    });
+    const thread = await created.json();
+    const edited = await fetch(`${url}/api/threads/${thread.id}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ body: 'after edit' }),
+    });
+    assert.equal(edited.status, 200);
+    assert.equal((await edited.json()).body, 'after edit');
+    const listed = (await (await fetch(`${url}/api/threads`)).json()).threads;
+    assert.equal(listed[0].body, 'after edit');
+    // status PATCH keeps working alongside
+    const resolved = await fetch(`${url}/api/threads/${thread.id}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ status: 'resolved' }),
+    });
+    assert.equal((await resolved.json()).status, 'resolved');
+  } finally {
+    await close();
+  }
 });
 
 test('mcp subcommand: stdio JSON-RPC serves tools end-to-end', async () => {

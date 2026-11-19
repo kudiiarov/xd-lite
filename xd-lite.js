@@ -26,9 +26,18 @@ import { spawn } from 'node:child_process';
 import { createServer as createHttpServer } from 'node:http';
 import { createInterface } from 'node:readline';
 import path from 'node:path';
-import { realpathSync } from 'node:fs';
+import { readFileSync, realpathSync } from 'node:fs';
 import { readFile, readdir, writeFile, mkdir, stat, unlink, appendFile } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
+
+/** Own package version (single source of truth: package.json). */
+const VERSION = (() => {
+  try {
+    return JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version || '0.0.0';
+  } catch {
+    return '0.0.0'; // file copied without package.json — degrade gracefully
+  }
+})();
 
 // ============================================================================
 // CLI
@@ -94,7 +103,18 @@ function resolveSource(flags) {
 }
 
 function sourceKey(source) {
-  return source.kind === 'vs' ? `vs:${source.base}` : source.kind;
+  if (source.kind === 'vs') return `vs:${source.base}`;
+  if (source.kind === 'commit') return `commit:${source.sha}`;
+  return source.kind;
+}
+
+/** Inverse of sourceKey: "commit:<sha>" / "vs:<base>" / working|staged|head → source. */
+function parseSourceKey(key) {
+  if (key === 'working' || key === 'staged' || key === 'head') return { kind: key };
+  const m = String(key || '').match(/^(vs|commit):(.+)$/);
+  if (!m || !m[2] || m[2].includes('..') || /[\s;&|`$]/.test(m[2])) return null;
+  if (m[1] === 'commit' && !/^[0-9a-f]{7,40}$/i.test(m[2])) return null; // commit names are hex shas
+  return m[1] === 'vs' ? { kind: 'vs', base: m[2] } : { kind: 'commit', sha: m[2] };
 }
 
 function diffSourceLabel(source) {
@@ -103,7 +123,35 @@ function diffSourceLabel(source) {
     case 'staged': return 'Staged';
     case 'head': return 'Latest commit';
     case 'vs': return `vs ${source.base}`;
+    case 'commit': return `Commit ${String(source.sha).slice(0, 7)}`;
   }
+}
+
+/** Base ref for whole-branch/commit-list browsing: an explicit --vs base wins,
+ *  else the first of upstream / origin-main / main-ish refs that exists and is
+ *  not HEAD itself. Null when nothing suitable exists (e.g. single-branch repo). */
+async function detectBase(worktreePath, source) {
+  if (source.kind === 'vs') return source.base;
+  const head = await runGit(worktreePath, ['rev-parse', 'HEAD']).catch(() => null);
+  if (!head) return null;
+  for (const c of ['@{upstream}', 'origin/main', 'origin/master', 'main', 'master']) {
+    const sha = await runGit(worktreePath, ['rev-parse', '--verify', '--quiet', `${c}^{commit}`]).catch(() => null);
+    if (sha && sha !== head) return c;
+  }
+  return null;
+}
+
+/** Commits on the branch (base..HEAD), newest first — the "iterations" list. */
+async function listCommits(worktreePath, base) {
+  if (!base) return [];
+  const out = await runGit(worktreePath, [
+    'log', '--format=%H%x1f%h%x1f%s%x1f%an%x1f%at', `${base}..HEAD`,
+  ]).catch(() => '');
+  if (!out) return [];
+  return out.split('\n').filter(Boolean).map((line) => {
+    const [sha, short, subject, author, at] = line.split('\x1f');
+    return { sha, short, subject, author, at: Number(at) * 1000 };
+  });
 }
 
 // ============================================================================
@@ -149,6 +197,7 @@ function baseArgs(source) {
     case 'staged': return ['diff', '--cached', 'HEAD'];
     case 'head': return ['show', '--format=', '--root', 'HEAD'];
     case 'vs': return ['diff', source.base];
+    case 'commit': return ['show', '--format=', '--root', source.sha];
   }
 }
 
@@ -538,6 +587,20 @@ function createLiteStore(worktreePath) {
       return { ...thread, outdated: currentSha !== thread.anchor.blobSha };
     },
 
+    /** Replace the thread body (edit); replies and frontmatter stay intact. */
+    async updateBody(id, body) {
+      if (typeof body !== 'string' || !body.trim()) {
+        throw Object.assign(new Error('empty body'), { statusCode: 400 });
+      }
+      const filePath = threadPath(worktreePath, id);
+      const raw = await readFile(filePath, 'utf8');
+      const thread = parseThread(raw, path.basename(id));
+      thread.body = body.trim();
+      await writeFile(filePath, serializeThread(thread), 'utf8');
+      const currentSha = await fileBlobSha(worktreePath, thread.file);
+      return { ...thread, outdated: currentSha !== thread.anchor.blobSha };
+    },
+
     /** Append an agent/human reply block (same shape as the core store). */
     async reply(id, input) {
       if (typeof input?.body !== 'string' || !input.body.trim()) {
@@ -635,12 +698,22 @@ function clientMain() {
     toastTimer = setTimeout(() => el.classList.add('hidden'), ms);
   }
 
-  /** Twitter-style: "You"/"Agent" + short relative time. */
+  /** "You" for the reviewer, the real name after the prefix for everyone else. */
   function authorLabel(a) {
     if (!a) return '';
-    if (a === 'human:me' || a.startsWith('human:')) return 'You';
-    if (a.startsWith('agent:')) return 'Agent';
+    if (a === 'human:me' || a === 'human:') return 'You';
+    const m = /^(human|agent):(.+)$/.exec(a);
+    if (m) return m[2] || m[1];
     return a;
+  }
+
+  /** Role class for the author chip ('human' | 'agent'). */
+  function authorRole(a) {
+    return String(a || '').startsWith('agent:') ? 'agent' : 'human';
+  }
+
+  function authorChip(author) {
+    return `<span class="t-author chip-${authorRole(author)}">${esc(authorLabel(author))}</span>`;
   }
 
   function relTime(iso) {
@@ -652,14 +725,6 @@ function clientMain() {
     if (s < 3600) return Math.max(1, Math.floor(s / 60)) + 'm';
     if (s < 86400) return Math.floor(s / 3600) + 'h';
     return `${d.getDate()}.${d.getMonth() + 1}`;
-  }
-
-  /** Friendlier pill text for the diff source ("Working tree" → "uncommitted"). */
-  function sourceShort(label) {
-    if (label === 'Working tree') return 'uncommitted';
-    if (label === 'Staged') return 'staged';
-    if (label === 'Latest commit') return 'last commit';
-    return label;
   }
 
   async function api(url, method, body) {
@@ -1001,7 +1066,7 @@ function clientMain() {
     return `<tr class="hunk-head" data-hunkhead="${hi}"><td class="num"></td><td class="code"><span class="tk-meta">${esc(header)}</span></td><td class="num"></td><td class="code"></td></tr>`;
   }
 
-  /** Twitter-minimal widget: big task checkbox (if any) + You/Agent · time. */
+  /** Twitter-minimal widget: big task checkbox (if any) + You/name · time. */
   function widgetCardHtml(t) {
     const isTask = t.category === 'request-changes';
     const done = t.status === 'resolved';
@@ -1010,17 +1075,29 @@ function clientMain() {
       h += `<span class="task-cb${done ? ' done' : ''}" data-task="${t.id}" title="${done ? 'Done — click to reopen' : 'Mark done'}">✓</span>`;
     }
     h += '<div class="t-main">';
-    h += `<div class="t-head"><span class="t-author">${esc(authorLabel(t.author))}</span><span class="t-time">${esc(relTime(t.createdAt))}</span><span class="flex"></span>`;
+    h += `<div class="t-head">${authorChip(t.author)}<span class="t-time">${esc(relTime(t.createdAt))}</span><span class="flex"></span>`;
     if (!done && !SENT) {
+      h += `<button class="icon-btn edit-thread" data-editstart="${t.id}" title="Edit">✎</button>`;
       h += `<span class="del-zone" id="dz-${t.id}"><button class="icon-btn del-thread" data-delstart="${t.id}" title="Delete">✕</button></span>`;
     }
     h += '</div>';
     h += `<div class="thread-body">${mdHtml(t.body)}</div>`;
     for (const r of t.replies ?? []) {
-      h += `<div class="reply"><div class="reply-head">${esc(authorLabel(r.author))} <span class="t-time">${esc(relTime(r.at))}</span></div><div class="reply-body">${mdHtml(r.body)}</div></div>`;
+      h += `<div class="reply"><div class="reply-head">${authorChip(r.author)} <span class="t-time">${esc(relTime(r.at))}</span></div><div class="reply-body">${mdHtml(r.body)}</div></div>`;
     }
     h += '</div></div>';
     return h;
+  }
+
+  /** Inline body editor swapped in for .thread-body while editing a remark. */
+  function threadEditHtml(id, body) {
+    return '<div class="thread-edit">' +
+      `<textarea class="composer-text edit-ta" data-editid="${esc(id)}">${esc(body)}</textarea>` +
+      '<div class="composer-actions">' +
+      '<span class="hint">Ctrl/⌘+Enter — save · Esc — cancel</span><span class="flex"></span>' +
+      `<button type="button" class="btn ghost" data-editcancel="${esc(id)}">Cancel</button>` +
+      `<button type="button" class="btn primary" data-editsave="${esc(id)}">Save</button>` +
+      '</div></div>';
   }
 
   /** In split view a widget stays on the half it was written on. */
@@ -1200,6 +1277,31 @@ function clientMain() {
     gapRow.outerHTML = html;
   }
 
+  /** Toolbar button: expand every context gap at once, or collapse them back.
+   *  Expanding mutates the DOM in place (renderMain would reset expandedGaps). */
+  async function toggleAllGaps() {
+    const f = FILES[curFile];
+    if (!f || !EXPANDABLE) return;
+    const anyCollapsed = document.querySelector('#content [data-gaprow]');
+    if (!anyCollapsed) {
+      expandedGaps = new Set();
+      renderMain();
+      return;
+    }
+    if (!(await ensureBlobs(curFile))) {
+      toast('Cannot expand context for this file (no blob or binary).');
+      return;
+    }
+    for (let gi = 0; gi < f.hunks.length; gi++) await expandGap(curFile, gi);
+    await expandGap(curFile, 't');
+    // repaint just the toolbar button — a full render would reset expandedGaps
+    const btn = document.querySelector('#toolbar [data-expandall]');
+    if (btn) {
+      btn.textContent = '⤡';
+      btn.title = 'Collapse context';
+    }
+  }
+
   function mdHtml(text) {
     const parts = String(text).split('```');
     let out = '';
@@ -1339,14 +1441,15 @@ function clientMain() {
       return;
     }
     const f = FILES[curFile];
+    // (a fresh render is always collapsed — fileTableHtml resets expandedGaps —
+    //  so the expand-all button starts in its "expand" state; toggleAllGaps
+    //  flips it in place after expanding)
     toolbar.innerHTML =
       `<span class="toolbar-path">${esc(f.path)}</span>${typeChip(f)}` +
       `<span class="badge add">+${f.adds}</span><span class="badge del">−${f.dels}</span>` +
       `<span class="flex"></span>` +
-      `<span class="view-toggle">` +
-      `<button class="vt-btn${viewMode === 'unified' ? ' active' : ''}" data-view="unified">Unified</button>` +
-      `<button class="vt-btn${viewMode === 'split' ? ' active' : ''}" data-view="split">Split</button>` +
-      `</span>`;
+      (EXPANDABLE ? `<button class="icon-btn" data-expandall title="Expand all context">⤢</button>` : '') +
+      `<button class="icon-btn" id="viewToggle" title="${viewMode === 'split' ? 'Switch to unified view' : 'Switch to split view'}">${viewMode === 'split' ? '◫' : '☰'}</button>`;
     if (f.binary) {
       content.innerHTML = '<div class="empty">Binary file — contents not shown.</div>';
       return;
@@ -1487,6 +1590,22 @@ function clientMain() {
     }
   }
 
+  async function saveThreadEdit(id) {
+    const ta = document.querySelector(`.edit-ta[data-editid="${id}"]`);
+    if (!ta) return;
+    if (!ta.value.trim()) {
+      ta.focus();
+      return;
+    }
+    try {
+      await api('/api/threads/' + encodeURIComponent(id), 'PATCH', { body: ta.value });
+      THREADS = (await api('/api/threads')).threads;
+      renderAll(true);
+    } catch (err) {
+      toast('Could not save edit: ' + err.message);
+    }
+  }
+
   function jumpToThread(id) {
     const t = THREADS.find((x) => x.id === id);
     if (!t) return;
@@ -1576,11 +1695,44 @@ function clientMain() {
       e.stopPropagation();
       if (hoverRow && hoverRow.isConnected && hoverPos && !SENT) {
         currentCat = quickBtn.dataset.quick;
-        sel = { file: curFile, side: hoverPos.side, start: hoverPos.line, end: hoverPos.line };
+        // keep a click/shift-click range if the hovered line belongs to it
+        const inSel = sel && sel.file === curFile && sel.side === hoverPos.side &&
+          hoverPos.line >= sel.start && hoverPos.line <= sel.end;
+        sel = {
+          file: curFile,
+          side: hoverPos.side,
+          start: inSel ? sel.start : hoverPos.line,
+          end: inSel ? sel.end : hoverPos.line,
+        };
         paintSelection(curFile);
         placeComposer(hoverRow);
       }
       hideHoverBar();
+      return;
+    }
+    // inline edit of a remark body: ✎ swaps .thread-body for an editor
+    const editStart = e.target.closest('[data-editstart]');
+    if (editStart) {
+      const id = editStart.dataset.editstart;
+      const card = document.querySelector(`[data-thread="${id}"]`);
+      const bodyEl = card && card.querySelector('.thread-body');
+      const t = THREADS.find((x) => x.id === id);
+      if (t && bodyEl) {
+        bodyEl.outerHTML = threadEditHtml(id, t.body);
+        const ta = card.querySelector('.edit-ta');
+        ta.focus();
+        ta.setSelectionRange(ta.value.length, ta.value.length);
+      }
+      return;
+    }
+    const editSave = e.target.closest('[data-editsave]');
+    if (editSave) {
+      saveThreadEdit(editSave.dataset.editsave);
+      return;
+    }
+    const editCancel = e.target.closest('[data-editcancel]');
+    if (editCancel) {
+      renderAll(true); // re-render restores the untouched body
       return;
     }
     // inline delete confirmation: ✕ morphs into "Delete? ✓ ✗"
@@ -1644,9 +1796,9 @@ function clientMain() {
       jumpToThread(gotoBtn.dataset.goto);
       return;
     }
-    const viewBtn = e.target.closest('[data-view]');
+    const viewBtn = e.target.closest('#viewToggle');
     if (viewBtn) {
-      viewMode = viewBtn.dataset.view;
+      viewMode = viewMode === 'split' ? 'unified' : 'split';
       store('xd-lite-view', viewMode);
       cancelComposer();
       renderMain();
@@ -1658,12 +1810,19 @@ function clientMain() {
       expandGap(Number(fi), gi === 't' ? 't' : Number(gi));
       return;
     }
-    // line selection — the clicked half decides the anchor side
+    const expandAllBtn = e.target.closest('[data-expandall]');
+    if (expandAllBtn) {
+      toggleAllGaps();
+      return;
+    }
+    // line selection — click picks/extends the range; the composer only ever
+    // opens from the hover pill's Task/Comment buttons, never from a click
     const tr = e.target.closest('#content tr.row');
     if (!tr || SENT) return;
     const pos = rowSideAt(tr, e);
     if (!pos) return;
     const { side, line } = pos;
+    if (composerTr.isConnected) hideHoverBar(); // stay hidden while composing
     if (e.shiftKey && sel && sel.side === side && sel.file === curFile) {
       sel.start = Math.min(sel.start, line);
       sel.end = Math.max(sel.end, line);
@@ -1671,7 +1830,6 @@ function clientMain() {
       sel = { file: curFile, side, start: line, end: line };
     }
     paintSelection(curFile);
-    placeComposer(tr);
   });
 
   document.addEventListener('change', (e) => {
@@ -1683,11 +1841,18 @@ function clientMain() {
   });
 
   document.addEventListener('keydown', (e) => {
-    if ((e.metaKey || e.ctrlKey) && e.key === 'Enter' && composerTr.isConnected) {
-      e.preventDefault();
-      submitComment();
-    } else if (e.key === 'Escape' && composerTr.isConnected) {
-      cancelComposer();
+    const editTa = e.target.closest && e.target.closest('.thread-edit .edit-ta');
+    if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+      if (editTa) {
+        e.preventDefault();
+        saveThreadEdit(editTa.dataset.editid);
+      } else if (composerTr.isConnected) {
+        e.preventDefault();
+        submitComment();
+      }
+    } else if (e.key === 'Escape') {
+      if (editTa) renderAll(true);
+      else if (composerTr.isConnected) cancelComposer();
     }
   });
 
@@ -1853,19 +2018,67 @@ function clientMain() {
   if (['file', 'status', 'time', 'type'].includes(savedSort)) sortKey = savedSort;
   $('sortSel').value = sortKey;
 
-  Promise.all([api('/api/diff'), api('/api/threads')])
-    .then(([d, t]) => {
-      LABEL = d.label;
-      BRANCH = d.branch || '';
-      EXPANDABLE = Boolean(d.expandable);
-      FILES = parseDiff(d.text);
+  // ------------------------------------------------------- diff source switcher
+  // "Iterations" of the content: working tree / staged / last commit / whole
+  // branch, plus every commit on the branch — switchable in the header.
+  let SRC_KEY = null;
+  let SRC_ITEMS = [];
+  let SRC_COMMITS = [];
+
+  function fillSrcSelect() {
+    const opts = SRC_ITEMS.map((it) =>
+      `<option value="${esc(it.key)}"${it.key === SRC_KEY ? ' selected' : ''}>${esc(it.label)}</option>`);
+    if (SRC_COMMITS.length) {
+      opts.push('<optgroup label="Commits on branch">' + SRC_COMMITS.map((c) =>
+        `<option value="commit:${esc(c.sha)}"${`commit:${c.sha}` === SRC_KEY ? ' selected' : ''}>${esc(c.short)} ${esc(c.subject)}</option>`
+      ).join('') + '</optgroup>');
+    }
+    const selEl = $('srcSel');
+    selEl.innerHTML = opts.join('');
+    selEl.title = `Diff source: ${LABEL} — what changes are shown`;
+  }
+
+  async function loadDiff(srcKey) {
+    const d = await api('/api/diff' + (srcKey ? '?src=' + encodeURIComponent(srcKey) : ''));
+    LABEL = d.label;
+    BRANCH = d.branch || '';
+    EXPANDABLE = Boolean(d.expandable);
+    FILES = parseDiff(d.text);
+    curFile = FILES.length ? 0 : null;
+    $('branchName').textContent = BRANCH || '(no branch)';
+    $('loading').classList.add('hidden');
+    renderAll(false);
+    $('mainArea').scrollTop = 0;
+  }
+
+  async function setSource(srcKey) {
+    if (srcKey === SRC_KEY) return;
+    cancelComposer();
+    $('loading').classList.remove('hidden');
+    try {
+      await loadDiff(srcKey);
+      SRC_KEY = srcKey;
+      store('xd-lite-src', srcKey);
+    } catch (err) {
+      toast('Could not load source: ' + err.message);
+    }
+    $('loading').classList.add('hidden');
+    fillSrcSelect(); // restores the selection when a load failed
+  }
+
+  $('srcSel').addEventListener('change', (e) => setSource(e.target.value));
+
+  const savedSrc = store('xd-lite-src') || '';
+  Promise.all([api('/api/sources'), api('/api/threads')])
+    .then(async ([s, t]) => {
+      SRC_ITEMS = s.items;
+      SRC_COMMITS = s.commits || [];
       THREADS = t.threads;
-      $('sourceLabel').textContent = sourceShort(LABEL);
-      $('sourceLabel').title = `Diff source: ${LABEL} — what changes are shown. Change via --vs <ref> or --source working|staged|head.`;
-      $('branchName').textContent = BRANCH || '(no branch)';
-      curFile = FILES.length ? 0 : null;
-      $('loading').classList.add('hidden');
-      renderAll(false);
+      const known = (k) => SRC_ITEMS.some((it) => it.key === k) ||
+        SRC_COMMITS.some((c) => `commit:${c.sha}` === k);
+      SRC_KEY = known(savedSrc) ? savedSrc : s.current;
+      fillSrcSelect();
+      await loadDiff(SRC_KEY);
     })
     .catch((err) => {
       $('loading').classList.add('hidden');
@@ -1903,8 +2116,9 @@ const PAGE = `<!doctype html>
   --cat-task: #cf222e; --cat-comment: #57606a;
   --tk-cm: #6e7781; --tk-st: #0a3069; --tk-kw: #cf222e; --tk-nu: #0550ae; --tk-fn: #8250df; --tk-prop: #0550ae;
   --code-font: ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace;
-  --ui-font: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+  --ui-font: system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
   --side-w: 300px;
+  --agent: #8250df; /* author chip: agents */
 }
 :root[data-theme='dark'] {
   --bg: #0d1117; --bg-subtle: #161b22; --bg-inset: #21262d;
@@ -1915,6 +2129,7 @@ const PAGE = `<!doctype html>
   --del-bg: #2d1517; --del-num-bg: #432024; --del-fg: #f85149;
   --sel-bg: #2d2a17; --card: #161b22; --shadow: 0 1px 3px rgba(0,0,0,.4);
   --cat-task: #f85149; --cat-comment: #8b949e;
+  --agent: #d2a8ff;
   --tk-cm: #8b949e; --tk-st: #a5d6ff; --tk-kw: #ff7b72; --tk-nu: #79c0ff; --tk-fn: #d2a8ff; --tk-prop: #79c0ff;
 }
 * { box-sizing: border-box; }
@@ -1923,6 +2138,7 @@ html, body { height: 100%; }
 body {
   margin: 0; font-family: var(--ui-font); font-size: 13px; color: var(--fg);
   background: var(--bg); overflow: hidden;
+  -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale;
 }
 body.resizing { cursor: col-resize; user-select: none; }
 ::selection { background: var(--sel-bg); }
@@ -1947,7 +2163,7 @@ button { font-family: var(--ui-font); }
 }
 .side-head { padding: 10px 12px; border-bottom: 1px solid var(--border); }
 .head-line {
-  display: flex; align-items: center; gap: 6px;
+  display: flex; align-items: center; gap: 4px;
   font-size: 13px; font-weight: 600; min-width: 0;
 }
 .brand { white-space: nowrap; }
@@ -1960,12 +2176,15 @@ button { font-family: var(--ui-font); }
 .head-stats { color: var(--fg-muted); white-space: nowrap; font-family: var(--code-font); font-size: 11.5px; }
 .head-stats .sa { color: var(--add-fg); font-style: normal; }
 .head-stats .sd { color: var(--del-fg); font-style: normal; }
-.source-label {
-  font-size: 10px; font-weight: 600; color: var(--accent); flex: 0 0 auto;
-  background: color-mix(in srgb, var(--accent) 10%, transparent);
-  border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
-  padding: 1px 7px; border-radius: 99px; white-space: nowrap;
+.src-select {
+  font-family: var(--ui-font); font-size: 11px; font-weight: 600; color: var(--accent);
+  background: var(--card); border: 1px solid var(--border); border-radius: 99px;
+  padding: 2px 6px; cursor: pointer;
+  /* shrink with the sidebar instead of pushing the theme toggle out of the header */
+  flex: 0 1 120px; min-width: 64px; max-width: 190px;
 }
+.src-select:hover { border-color: var(--accent); }
+.src-select:focus { outline: none; border-color: var(--accent); }
 .icon-btn {
   border: 1px solid var(--border); background: var(--card); color: var(--fg-muted);
   border-radius: 6px; width: 24px; height: 24px; cursor: pointer; font-size: 12px;
@@ -2082,12 +2301,6 @@ body.resizing-v { cursor: row-resize; user-select: none; }
 .badge.add { color: var(--add-fg); background: color-mix(in srgb, var(--add-fg) 12%, transparent); }
 .badge.del { color: var(--del-fg); background: color-mix(in srgb, var(--del-fg) 12%, transparent); }
 .badge.type-badge { color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); }
-.view-toggle { display: inline-flex; border: 1px solid var(--border); border-radius: 7px; overflow: hidden; }
-.vt-btn {
-  border: none; background: var(--card); color: var(--fg-muted);
-  font-size: 11px; font-weight: 600; padding: 4px 10px; cursor: pointer;
-}
-.vt-btn.active { background: var(--accent); color: var(--accent-fg); }
 
 #loading, .empty { text-align: center; color: var(--fg-muted); padding: 60px 0; font-size: 14px; }
 
@@ -2149,16 +2362,28 @@ tr.hunk-head td.code, tr.meta-row td.code { color: var(--fg-subtle); padding-top
 .task-cb:hover { background: color-mix(in srgb, var(--cat-task) 12%, transparent); }
 .task-cb.done { background: var(--cat-task); color: #fff; }
 .t-main { flex: 1 1 0; min-width: 0; }
-.t-head { display: flex; align-items: center; gap: 7px; margin-bottom: 3px; }
-.t-author { font-size: 12px; font-weight: 700; }
+.t-head { display: flex; align-items: center; gap: 7px; margin-bottom: 5px; }
+.t-author {
+  display: inline-flex; align-items: center; padding: 1px 8px; border-radius: 99px;
+  font-size: 11px; font-weight: 600; letter-spacing: .1px; white-space: nowrap;
+}
+.chip-human { color: var(--accent); background: color-mix(in srgb, var(--accent) 10%, transparent); }
+.chip-agent { color: var(--agent); background: color-mix(in srgb, var(--agent) 12%, transparent); }
 .t-time { font-size: 11px; color: var(--fg-subtle); }
-.thread-body { font-size: 13px; line-height: 1.5; overflow-wrap: break-word; }
+.thread-body { font-size: 13px; line-height: 1.55; overflow-wrap: break-word; }
 .thread-body code, .reply-body code { font-family: var(--code-font); font-size: 12px; background: var(--bg-inset); padding: 1px 4px; border-radius: 4px; }
 .thread-body pre { background: var(--bg-inset); border: 1px solid var(--border-subtle); border-radius: 6px; padding: 8px 10px; overflow-x: auto; margin: 6px 0; }
 .thread-body pre code { background: none; padding: 0; }
-.reply { padding: 6px 0 0; margin-top: 6px; border-top: 1px solid var(--border-subtle); }
-.reply-head { font-size: 12px; font-weight: 600; margin-bottom: 2px; }
-.reply-body { font-size: 13px; line-height: 1.5; overflow-wrap: break-word; }
+/* replies are the other party's words — keep them clearly set off from the
+   remark itself with a left accent bar and an indent */
+.reply {
+  margin-top: 8px; padding: 7px 0 2px 11px;
+  border-top: 1px solid var(--border-subtle); border-left: 2px solid var(--border-subtle);
+}
+.reply-head { display: flex; align-items: center; gap: 7px; margin-bottom: 3px; }
+.reply-body { font-size: 13px; line-height: 1.55; overflow-wrap: break-word; }
+.thread-edit { margin-top: 2px; }
+.thread-edit .composer-text { min-height: 54px; }
 .del-zone { display: inline-flex; align-items: center; gap: 4px; }
 .del-q { font-size: 11px; color: var(--del-fg); font-weight: 600; white-space: nowrap; }
 .mini-btn {
@@ -2249,7 +2474,7 @@ tr.row.hb-hl td:not(.num):not(.sel) { background: var(--bg-subtle); }
         <span class="hsep">·</span>
         <span class="head-stats" id="stats"></span>
         <span class="flex"></span>
-        <span id="sourceLabel" class="source-label"></span>
+        <select id="srcSel" class="src-select" title="Diff source — what changes are shown"></select>
         <button id="themeToggle" class="icon-btn" title="Toggle theme">◐</button>
       </div>
     </div>
@@ -2377,21 +2602,70 @@ async function startLiteServer({ repoPath, port = 0, source, author }) {
         sendJson(res, 200, { ok: true });
         return;
       }
-      if (req.method === 'GET' && pathname === '/api/diff') {
-        const branch = await runGit(repoPath, ['rev-parse', '--abbrev-ref', 'HEAD']).catch(() => '');
-        const text = await getDiffText(repoPath, source);
+      if (req.method === 'GET' && pathname === '/api/sources') {
+        const base = await detectBase(repoPath, source);
+        const commits = await listCommits(repoPath, base);
         sendJson(res, 200, {
-          source: sourceKey(source),
+          current: sourceKey(source),
+          base,
           label,
+          items: [
+            { key: 'working', label: 'Working tree' },
+            { key: 'staged', label: 'Staged' },
+            { key: 'head', label: 'Latest commit' },
+            ...(base ? [{ key: `vs:${base}`, label: `Whole branch (vs ${base})` }] : []),
+          ],
+          commits,
+        });
+        return;
+      }
+      if (req.method === 'GET' && pathname === '/api/diff') {
+        // ?src=<key> switches the source in-UI (working|staged|head|vs:<base>|commit:<sha>)
+        const srcKey = url.searchParams.get('src');
+        let effSource = source;
+        let effLabel = label;
+        if (srcKey != null) {
+          const parsed = parseSourceKey(srcKey);
+          if (!parsed) {
+            sendJson(res, 400, { error: 'invalid src (working | staged | head | vs:<ref> | commit:<sha>)' });
+            return;
+          }
+          effSource = parsed;
+          effLabel = diffSourceLabel(parsed);
+        }
+        const branch = await runGit(repoPath, ['rev-parse', '--abbrev-ref', 'HEAD']).catch(() => '');
+        let text;
+        try {
+          text = await getDiffText(repoPath, effSource);
+        } catch (err) {
+          if (err instanceof GitError) {
+            sendJson(res, 400, { error: `unknown revision for src — ${err.message}` });
+            return;
+          }
+          throw err;
+        }
+        sendJson(res, 200, {
+          source: sourceKey(effSource),
+          label: effLabel,
           text,
           branch,
-          expandable: source.kind === 'working' || source.kind === 'vs',
+          expandable: effSource.kind !== 'staged',
         });
         return;
       }
       if (req.method === 'GET' && pathname === '/api/blob') {
         const p = url.searchParams.get('path') ?? '';
         const side = url.searchParams.get('side') === 'old' ? 'old' : 'new';
+        const srcKey = url.searchParams.get('src');
+        let blobSource = source;
+        if (srcKey != null) {
+          const parsed = parseSourceKey(srcKey);
+          if (!parsed) {
+            sendJson(res, 400, { error: 'invalid src' });
+            return;
+          }
+          blobSource = parsed;
+        }
         if (!p || p.includes('..') || path.isAbsolute(p)) {
           sendJson(res, 400, { error: 'invalid path' });
           return;
@@ -2399,10 +2673,13 @@ async function startLiteServer({ repoPath, port = 0, source, author }) {
         let blob = null;
         if (side === 'new') {
           blob = await worktreeBlob(repoPath, p);
-        } else if (source.kind === 'working') {
+        } else if (blobSource.kind === 'working') {
           blob = await gitBlob(repoPath, 'HEAD', p);
-        } else if (source.kind === 'vs') {
-          blob = await gitBlob(repoPath, source.base, p);
+        } else if (blobSource.kind === 'vs') {
+          blob = await gitBlob(repoPath, blobSource.base, p);
+        } else if (blobSource.kind === 'commit') {
+          const parent = await runGit(repoPath, ['rev-parse', `${blobSource.sha}^`]).catch(() => null);
+          blob = parent ? await gitBlob(repoPath, parent, p) : { text: '' }; // root commit: all new
         }
         if (!blob) {
           sendJson(res, 404, { error: 'blob not found' });
@@ -2426,7 +2703,11 @@ async function startLiteServer({ repoPath, port = 0, source, author }) {
         const id = decodeURIComponent(idMatch[1]);
         if (req.method === 'PATCH') {
           const body = await readJsonBody(req);
-          sendJson(res, 200, await store.setStatus(id, body.status, body.actor || author));
+          // { body } edits the remark text; anything else toggles the task status
+          const updated = typeof body?.body === 'string'
+            ? await store.updateBody(id, body.body)
+            : await store.setStatus(id, body.status, body.actor || author);
+          sendJson(res, 200, updated);
         } else {
           try {
             await store.remove(id);
@@ -2690,7 +2971,7 @@ async function runMcp({ repoPath = null, source, author }) {
         result: {
           protocolVersion: msg.params?.protocolVersion ?? '2024-11-05',
           capabilities: { tools: {} },
-          serverInfo: { name: 'xd-lite', title: 'XD Lite', version: '0.1.0' },
+          serverInfo: { name: 'xd-lite', title: 'XD Lite', version: VERSION },
         },
       });
     } else if (msg.method === 'tools/list') {
