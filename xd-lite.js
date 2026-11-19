@@ -1396,10 +1396,12 @@ function clientMain() {
       : '<span class="c-ico"></span>'; // plain filled dot — not a button
     const snip = t.body.replace(/\s+/g, ' ').trim().slice(0, 80);
     const sideMark = t.anchor.side === 'old' ? '−' : '';
+    const [l1, l2] = t.anchor.lines;
+    const lineStr = l2 > l1 ? `${l1}–${l2}` : `${l1}`; // shift-click range is visible
     return `<div class="c-item${done ? ' resolved' : ''}" data-goto="${t.id}">` +
       box +
       `<span class="c-body">` +
-      `<span class="c-meta">${esc(t.file.split('/').pop())}:${sideMark}${t.anchor.lines[0]} · ${esc(authorLabel(t.author))} · ${esc(relTime(t.createdAt))}</span>` +
+      `<span class="c-meta">${esc(t.file.split('/').pop())}:${sideMark}${lineStr} · ${esc(authorLabel(t.author))} · ${esc(relTime(t.createdAt))}</span>` +
       `<span class="c-snip">${esc(snip)}</span>` +
       `</span></div>`;
   }
@@ -1468,14 +1470,12 @@ function clientMain() {
   // -------------------------------------------------------------- selection
 
   function composerInner() {
-    const cats = CATS.map((c) =>
-      `<button type="button" class="cat-btn cat-${c.key}${c.key === currentCat ? ' active' : ''}" data-cat="${c.key}">${c.label}</button>`
-    ).join('');
+    // The kind (Task/Comment) is picked on the hover pill before the composer
+    // opens — no duplicate category buttons inside (they read as stray pills).
     const primary = currentCat === 'task' ? 'Add task' : 'Add comment';
     return '<div class="composer">' +
       '<textarea class="composer-text" placeholder="Leave a comment — markdown is ok"></textarea>' +
       '<div class="composer-actions"><span class="hint">Ctrl/⌘+Enter — send · Esc — cancel</span><span class="flex"></span>' +
-      cats +
       '<button type="button" class="btn ghost" data-act="cancel">Cancel</button>' +
       `<button type="button" class="btn primary" data-act="send">${primary}</button>` +
       '</div></div>';
@@ -1486,19 +1486,6 @@ function clientMain() {
   composerTr.innerHTML = `<td colspan="3">${composerInner()}</td>`;
 
   composerTr.addEventListener('click', (e) => {
-    const catBtn = e.target.closest('.cat-btn');
-    if (catBtn) {
-      currentCat = catBtn.dataset.cat;
-      const ta = composerTr.querySelector('textarea');
-      const value = ta ? ta.value : '';
-      const focused = document.activeElement === ta;
-      composerTr.querySelector('.composer').outerHTML = composerInner();
-      const ta2 = composerTr.querySelector('textarea');
-      ta2.value = value;
-      ta2.focus();
-      if (!focused) ta2.setSelectionRange(value.length, value.length);
-      return;
-    }
     const btn = e.target.closest('[data-act]');
     if (!btn) return;
     if (btn.dataset.act === 'send') submitComment();
@@ -2166,8 +2153,6 @@ button { font-family: var(--ui-font); }
   display: flex; align-items: center; gap: 4px;
   font-size: 13px; font-weight: 600; min-width: 0;
 }
-.brand { white-space: nowrap; }
-.brand .lite { color: var(--accent); }
 .hsep { color: var(--fg-subtle); font-weight: 400; }
 .repo-name {
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; max-width: 42%;
@@ -2211,6 +2196,8 @@ button { font-family: var(--ui-font); }
 .panel-resize {
   flex: 0 0 5px; cursor: row-resize; margin: -2px 0; z-index: 15;
   transition: background .15s;
+  /* a visible 1px divider so the resize affordance can be discovered */
+  background: linear-gradient(to bottom, transparent 2px, var(--border) 2px, var(--border) 3px, transparent 3px);
 }
 .panel-resize:hover, body.resizing-v .panel-resize {
   background: color-mix(in srgb, var(--accent) 40%, transparent);
@@ -2348,16 +2335,15 @@ tr.hunk-head td.code, tr.meta-row td.code { color: var(--fg-subtle); padding-top
   margin: 6px; padding: 10px 12px; border-radius: 8px;
   background: var(--card); border: 1px solid var(--border);
   box-shadow: var(--shadow);
-  display: flex; gap: 12px; align-items: center;
+  display: flex; gap: 12px; align-items: flex-start;
 }
-.thread.is-task { border-left: 3px solid var(--cat-task); }
-.thread.is-comment { border-left: 3px solid var(--cat-comment); }
 .thread.resolved { opacity: .55; }
 .thread.flash { outline: 2px solid var(--accent); }
 .task-cb {
-  flex: 0 0 26px; width: 26px; height: 26px; border: 2px solid var(--cat-task); border-radius: 8px;
-  color: transparent; font-size: 16px; font-weight: 800; line-height: 22px; text-align: center;
+  flex: 0 0 26px; width: 26px; height: 26px; border: 1px solid var(--cat-task); border-radius: 8px;
+  color: transparent; font-size: 15px; font-weight: 800; line-height: 24px; text-align: center;
   cursor: pointer; user-select: none; transition: background .15s, color .15s;
+  margin-top: 1px; /* stay on the first line as the comment grows */
 }
 .task-cb:hover { background: color-mix(in srgb, var(--cat-task) 12%, transparent); }
 .task-cb.done { background: var(--cat-task); color: #fff; }
@@ -2374,11 +2360,11 @@ tr.hunk-head td.code, tr.meta-row td.code { color: var(--fg-subtle); padding-top
 .thread-body code, .reply-body code { font-family: var(--code-font); font-size: 12px; background: var(--bg-inset); padding: 1px 4px; border-radius: 4px; }
 .thread-body pre { background: var(--bg-inset); border: 1px solid var(--border-subtle); border-radius: 6px; padding: 8px 10px; overflow-x: auto; margin: 6px 0; }
 .thread-body pre code { background: none; padding: 0; }
-/* replies are the other party's words — keep them clearly set off from the
-   remark itself with a left accent bar and an indent */
+/* replies read as a nested thread card: an inset, tinted block inside the
+   remark — clearly the other party's answer, not part of the question */
 .reply {
-  margin-top: 8px; padding: 7px 0 2px 11px;
-  border-top: 1px solid var(--border-subtle); border-left: 2px solid var(--border-subtle);
+  margin-top: 8px; padding: 8px 10px;
+  background: var(--bg-subtle); border: 1px solid var(--border-subtle); border-radius: 8px;
 }
 .reply-head { display: flex; align-items: center; gap: 7px; margin-bottom: 3px; }
 .reply-body { font-size: 13px; line-height: 1.55; overflow-wrap: break-word; }
@@ -2436,14 +2422,6 @@ tr.row.hb-hl td:not(.num):not(.sel) { background: var(--bg-subtle); }
 .composer-text:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 25%, transparent); }
 .composer-actions { display: flex; align-items: center; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
 .hint { font-size: 11px; color: var(--fg-subtle); margin-right: 4px; }
-.cat-btn {
-  border: 1px solid var(--border); background: var(--card); color: var(--fg-muted);
-  font-size: 12px; font-weight: 600; padding: 4px 10px; border-radius: 99px; cursor: pointer;
-  transition: all .15s;
-}
-.cat-btn:hover { color: var(--fg); }
-.cat-btn.active.cat-task { color: var(--cat-task); border-color: var(--cat-task); background: color-mix(in srgb, var(--cat-task) 10%, transparent); }
-.cat-btn.active.cat-comment { color: var(--cat-comment); border-color: var(--cat-comment); background: color-mix(in srgb, var(--cat-comment) 10%, transparent); }
 .btn { font-size: 12px; font-weight: 600; padding: 5px 12px; border-radius: 6px; cursor: pointer; border: 1px solid var(--border); transition: all .15s; }
 .btn.ghost { background: var(--card); color: var(--fg-muted); }
 .btn.ghost:hover { color: var(--fg); }
@@ -2466,8 +2444,6 @@ tr.row.hb-hl td:not(.num):not(.sel) { background: var(--bg-subtle); }
   <aside class="sidebar">
     <div class="side-head">
       <div class="head-line">
-        <span class="brand">XD <span class="lite">Lite</span></span>
-        <span class="hsep">·</span>
         <span class="repo-name" id="repoName" title="${'${REPO_PATH}'}">${'${REPO_NAME}'}</span>
         <span class="hsep">·</span>
         <span class="branch-name" id="branchName"></span>
