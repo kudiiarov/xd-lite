@@ -1404,6 +1404,7 @@ function clientMain() {
 
   function placeComposer(row) {
     composerTr.remove();
+    hideHoverBar();
     const side = sel && sel.side === 'old' ? 'old' : 'new';
     if (viewMode === 'split') {
       const inner = `<td colspan="2" class="wcell">${composerInner()}</td><td class="wvoid"></td><td class="wvoid"></td>`;
@@ -1419,6 +1420,7 @@ function clientMain() {
 
   function cancelComposer() {
     composerTr.remove();
+    hideHoverBar();
     sel = null;
     document.querySelectorAll('tr.row.sel').forEach((r) => r.classList.remove('sel'));
   }
@@ -1508,7 +1510,79 @@ function clientMain() {
 
   // ------------------------------------------------------------- delegations
 
+  // ------------------------------------------------------ hover quick-add
+  // Hovering a diff line (with its highlight) shows a small Task/Comment pill
+  // under the cursor: the remark kind is picked before the click, and the
+  // composer opens pre-set to that kind — no click-then-choose roundtrip.
+  const hoverBar = $('hoverBar');
+  let hoverRow = null; // tr.row the bar is anchored to
+  let hoverPos = null; // { side, line } under the cursor
+
+  function hideHoverBar() {
+    if (hoverRow) hoverRow.classList.remove('hb-hl');
+    hoverRow = null;
+    hoverPos = null;
+    hoverBar.classList.remove('show');
+  }
+
+  /** Which side/line of the row the pointer is on (split view: the half decides). */
+  function rowSideAt(tr, e) {
+    if (viewMode === 'split') {
+      const onLeft = e.target.closest('td.code-old, td.num-old');
+      if (onLeft && tr.dataset.old != null) return { side: 'old', line: Number(tr.dataset.old) };
+      if (tr.dataset.new != null) return { side: 'new', line: Number(tr.dataset.new) };
+      if (tr.dataset.old != null) return { side: 'old', line: Number(tr.dataset.old) };
+      return null;
+    }
+    if (tr.dataset.new != null) return { side: 'new', line: Number(tr.dataset.new) };
+    if (tr.dataset.old != null) return { side: 'old', line: Number(tr.dataset.old) };
+    return null;
+  }
+
+  document.addEventListener('mousemove', (e) => {
+    // while the composer is open the pill stays out of the way entirely
+    if (SENT || composerTr.isConnected) { hideHoverBar(); return; }
+    const tr = e.target.closest('#content tr.row');
+    if (!tr) {
+      // the pill's own bridge/hit area keeps the current anchor alive
+      if (!e.target.closest('#hoverBar')) hideHoverBar();
+      return;
+    }
+    const pos = rowSideAt(tr, e);
+    if (!pos) { hideHoverBar(); return; }
+    if (hoverRow !== tr) {
+      if (hoverRow) hoverRow.classList.remove('hb-hl');
+      hoverRow = tr;
+      tr.classList.add('hb-hl');
+    }
+    hoverPos = pos;
+    const rect = tr.getBoundingClientRect();
+    hoverBar.classList.add('show');
+    const bw = hoverBar.offsetWidth;
+    const bh = hoverBar.offsetHeight;
+    const left = Math.min(Math.max(8, e.clientX - bw / 2), window.innerWidth - bw - 8);
+    let top = rect.bottom + 4;
+    if (top + bh > window.innerHeight - 8) top = rect.top - bh - 4; // flip above near the bottom
+    hoverBar.style.left = Math.round(left) + 'px';
+    hoverBar.style.top = Math.round(top) + 'px';
+  });
+
+  $('mainArea').addEventListener('scroll', hideHoverBar, { passive: true });
+
   document.addEventListener('click', (e) => {
+    // quick-add pill: open the composer pre-set to the picked kind
+    const quickBtn = e.target.closest('#hoverBar [data-quick]');
+    if (quickBtn) {
+      e.stopPropagation();
+      if (hoverRow && hoverRow.isConnected && hoverPos && !SENT) {
+        currentCat = quickBtn.dataset.quick;
+        sel = { file: curFile, side: hoverPos.side, start: hoverPos.line, end: hoverPos.line };
+        paintSelection(curFile);
+        placeComposer(hoverRow);
+      }
+      hideHoverBar();
+      return;
+    }
     // inline delete confirmation: ✕ morphs into "Delete? ✓ ✗"
     const delStart = e.target.closest('[data-delstart]');
     if (delStart) {
@@ -1587,19 +1661,9 @@ function clientMain() {
     // line selection — the clicked half decides the anchor side
     const tr = e.target.closest('#content tr.row');
     if (!tr || SENT) return;
-    let side;
-    let line;
-    if (viewMode === 'split') {
-      const onLeft = e.target.closest('td.code-old, td.num-old');
-      if (onLeft && tr.dataset.old != null) { side = 'old'; line = Number(tr.dataset.old); }
-      else if (tr.dataset.new != null) { side = 'new'; line = Number(tr.dataset.new); }
-      else if (tr.dataset.old != null) { side = 'old'; line = Number(tr.dataset.old); }
-      else return;
-    } else {
-      if (tr.dataset.new != null) { side = 'new'; line = Number(tr.dataset.new); }
-      else if (tr.dataset.old != null) { side = 'old'; line = Number(tr.dataset.old); }
-      else return;
-    }
+    const pos = rowSideAt(tr, e);
+    if (!pos) return;
+    const { side, line } = pos;
     if (e.shiftKey && sel && sel.side === side && sel.file === curFile) {
       sel.start = Math.min(sel.start, line);
       sel.end = Math.max(sel.end, line);
@@ -2107,6 +2171,33 @@ tr.hunk-head td.code, tr.meta-row td.code { color: var(--fg-subtle); padding-top
 .mini-btn:hover { color: var(--fg); }
 .thread .icon-btn { width: 20px; height: 20px; font-size: 11px; }
 
+/* hover quick-add bar: appears under the hovered line at the cursor —
+   the remark kind (Task/Comment) is picked before the click, not after */
+.hover-bar {
+  position: fixed; z-index: 60; display: inline-flex; gap: 2px; padding: 3px;
+  background: var(--card); border: 1px solid var(--border); border-radius: 9px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, .18);
+  opacity: 0; transform: translateY(-3px) scale(.97); pointer-events: none;
+  transition: opacity .1s ease, transform .1s ease;
+}
+.hover-bar.show { opacity: 1; transform: none; pointer-events: auto; }
+/* invisible bridge over the 4px gap: the cursor can slide off the line into the
+   pill without crossing into the next line (which would yank the pill away) */
+.hover-bar::before { content: ''; position: absolute; left: 0; right: 0; top: -10px; height: 10px; }
+/* keep the anchor line highlighted while its pill is up — CSS :hover drops as
+   soon as the cursor leaves the row for the pill */
+tr.row.hb-hl td:not(.num):not(.sel) { background: var(--bg-subtle); }
+.hb-btn {
+  display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600;
+  padding: 3px 10px; border: 0; border-radius: 6px; background: transparent;
+  color: var(--fg-muted); cursor: pointer; white-space: nowrap;
+}
+.hb-btn:hover { background: var(--bg-inset); }
+.hb-dot { width: 7px; height: 7px; border-radius: 50%; }
+.hb-task { color: var(--cat-task); }
+.hb-task .hb-dot { background: var(--cat-task); }
+.hb-comment { color: var(--cat-comment); }
+.hb-comment .hb-dot { background: var(--cat-comment); }
 .composer-row td { padding: 0; }
 .composer {
   margin: 6px; padding: 10px 12px; border-radius: 8px;
@@ -2205,6 +2296,10 @@ tr.hunk-head td.code, tr.meta-row td.code { color: var(--fg-subtle); padding-top
   </main>
 </div>
 <div id="toast" class="toast hidden"></div>
+<div id="hoverBar" class="hover-bar">
+  <button type="button" class="hb-btn hb-task" data-quick="task"><span class="hb-dot"></span>Task</button>
+  <button type="button" class="hb-btn hb-comment" data-quick="comment"><span class="hb-dot"></span>Comment</button>
+</div>
 <script>
 ${'${CLIENT_SRC}'}
 </script>
