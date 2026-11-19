@@ -5,6 +5,7 @@ import { mkdtempSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+// Cross-compat check: the full XD store must read what lite writes (and vice versa).
 // Cross-format check against the full XD store. In the XD monorepo @xd/core is
 // a workspace package (built by the test script); in this standalone repo it is
 // absent and the cross-format tests skip automatically.
@@ -237,10 +238,11 @@ test('lite server: health, diff, threads CRUD and handoff end-to-end', { skip: c
     const handoff = await fetch(`${url}/api/handoff`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ token: 'tok123' }),
+      body: JSON.stringify({ token: 'tok123', agentMayResolve: false }),
     });
     assert.deepEqual(await handoff.json(), { ok: true });
-    await pending;
+    // the human's resolution preference reaches the waiting CLI
+    assert.deepEqual(await pending, { agentMayResolve: false });
     assert.equal(
       (
         await fetch(`${url}/api/handoff`, {
@@ -264,6 +266,9 @@ test('lite server: health, diff, threads CRUD and handoff end-to-end', { skip: c
     assert.match(page, /srcSel/, 'diff-source switcher inlined');
     assert.match(page, /data-expandall/, 'expand-all-context button inlined');
     assert.match(page, /data-quick/, 'hover quick-add pill inlined');
+    assert.match(page, /showResolvedChk/, 'show-resolved toggle inlined');
+    assert.match(page, /agentResolveChk/, 'agent-may-resolve setting inlined');
+    assert.match(page, /t-resolvedby/, 'resolved-by badge inlined');
     assert.match(page, /data-task=/, 'task checkbox rendering inlined');
     assert.match(page, /data-sort/, 'comment sorting selector inlined');
     assert.match(page, /sideResize/, 'sidebar resize handle inlined');
@@ -573,6 +578,12 @@ test('renderHandoff emits the REVIEW_FILE markdown contract', () => {
   assert.match(md, /> \*\*agent:x:\*\* done/);
   assert.match(md, /request-changes \(Task\)\*\* — fix the code/);
   assert.match(md, /plain toggle/);
+  assert.doesNotMatch(md, /human resolves threads themselves/i, 'no manual-resolution note by default');
+
+  // the human can forbid the agent from resolving on their behalf
+  const manual = renderHandoff('/repo', [{ id: '01TEST', file: 'a.txt', category: 'comment', anchor: { lines: [1, 1] }, body: 'x', replies: [] }], { agentMayResolve: false });
+  assert.match(manual, /human resolves threads themselves/i);
+  assert.match(manual, /leave every thread open/);
 });
 
 // ---- CLI spawn tests: the contract other harnesses rely on -----------------

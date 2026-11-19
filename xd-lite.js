@@ -626,7 +626,7 @@ function createLiteStore(worktreePath) {
 // Handoff — same REVIEW_FILE contract as the full xd CLI
 // ============================================================================
 
-function renderHandoff(repoPath, threads) {
+function renderHandoff(repoPath, threads, { agentMayResolve = true } = {}) {
   const lines = [
     '# Code review feedback',
     '',
@@ -637,10 +637,20 @@ function renderHandoff(repoPath, threads) {
     '- **question** — answer in a reply (and fix code if the answer reveals a problem), then resolve.',
     '- **comment** — informational; reply briefly if useful and resolve.',
     '',
+  ];
+  if (!agentMayResolve) {
+    lines.push(
+      '> ❗ **The human resolves threads themselves.** Do NOT set threads to `resolved` —',
+      '> no frontmatter edits, no resolve_thread calls. Fix the code, reply what you did,',
+      '> and leave every thread open: the human will verify and resolve in the viewer.',
+      '',
+    );
+  }
+  lines.push(
     'Task checkboxes are a plain toggle: tick a task only when you are actually done with it.',
     'Resolve by setting `status: resolved` in the thread file frontmatter (or via xd mcp tools).',
     '',
-  ];
+  );
   for (const t of threads) {
     lines.push('---', '');
     lines.push(`## [${t.category}] ${t.file}:${t.anchor.lines[0]}${t.anchor.side === 'old' ? ' (removed line)' : ''}`);
@@ -675,6 +685,7 @@ function clientMain() {
   let currentCat = 'task';   // composer kind: 'task' | 'comment'
   let viewMode = 'unified';
   let sortKey = 'file';
+  let showResolved = true;   // sidebar keeps resolved remarks visible by default
   let collapsed = new Set(); // collapsed dir paths
 
   // Lite remark kinds: Task (agent fixes it, checkbox is a plain toggle) and Comment.
@@ -1080,6 +1091,9 @@ function clientMain() {
       h += `<button class="icon-btn edit-thread" data-editstart="${t.id}" title="Edit">✎</button>`;
       h += `<span class="del-zone" id="dz-${t.id}"><button class="icon-btn del-thread" data-delstart="${t.id}" title="Delete">✕</button></span>`;
     }
+    if (done && t.resolvedBy) {
+      h += `<span class="t-resolvedby" title="Who marked this done">✓ ${esc(authorLabel(t.resolvedBy))}</span>`;
+    }
     h += '</div>';
     h += `<div class="thread-body">${mdHtml(t.body)}</div>`;
     for (const r of t.replies ?? []) {
@@ -1398,10 +1412,11 @@ function clientMain() {
     const sideMark = t.anchor.side === 'old' ? '−' : '';
     const [l1, l2] = t.anchor.lines;
     const lineStr = l2 > l1 ? `${l1}–${l2}` : `${l1}`; // shift-click range is visible
+    const resolvedTxt = done && t.resolvedBy ? ` · ✓ ${esc(authorLabel(t.resolvedBy))}` : '';
     return `<div class="c-item${done ? ' resolved' : ''}" data-goto="${t.id}">` +
       box +
       `<span class="c-body">` +
-      `<span class="c-meta">${esc(t.file.split('/').pop())}:${sideMark}${lineStr} · ${esc(authorLabel(t.author))} · ${esc(relTime(t.createdAt))}</span>` +
+      `<span class="c-meta">${esc(t.file.split('/').pop())}:${sideMark}${lineStr} · ${esc(authorLabel(t.author))} · ${esc(relTime(t.createdAt))}${resolvedTxt}</span>` +
       `<span class="c-snip">${esc(snip)}</span>` +
       `</span></div>`;
   }
@@ -1425,10 +1440,10 @@ function clientMain() {
     $('commentCount').textContent = THREADS.length || '';
     $('fileCount').textContent = FILES.length || '';
     $('tree').innerHTML = FILES.length ? treeHtml(buildTree(), 0) : '<div class="tree-empty">No changes</div>';
-    const sorted = sortedThreads();
+    const sorted = sortedThreads().filter((t) => showResolved || t.status !== 'resolved');
     $('commentList').innerHTML = sorted.length
       ? sorted.map(commentItemHtml).join('')
-      : '<div class="tree-empty">No comments yet — click a line in the diff.</div>';
+      : '<div class="tree-empty">No comments yet — hover a line in the diff and pick Task or Comment.</div>';
     $('sendBtn').textContent = 'Send review to agent';
   }
 
@@ -1943,7 +1958,7 @@ function clientMain() {
 
   // -------------------------------------------------------- send review / handoff
 
-  function buildReviewMarkdown() {
+  function buildReviewMarkdown(agentMayResolve = true) {
     const open = THREADS.filter((t) => t.status !== 'resolved');
     const lines = [
       '# Code review feedback',
@@ -1956,6 +1971,14 @@ function clientMain() {
       '- **comment** — informational; reply briefly if useful and resolve.',
       '',
     ];
+    if (!agentMayResolve) {
+      lines.push(
+        '> ❗ **The human resolves threads themselves.** Do NOT set threads to `resolved` —',
+        '> no frontmatter edits, no resolve_thread calls. Fix the code, reply what you did,',
+        '> and leave every thread open: the human will verify and resolve in the viewer.',
+        '',
+      );
+    }
     for (const t of open) {
       lines.push('---', '');
       lines.push(`## [${t.category}] ${t.file}:${t.anchor.lines[0]}${t.anchor.side === 'old' ? ' (removed line)' : ''}`);
@@ -1972,22 +1995,27 @@ function clientMain() {
 
   async function sendReview() {
     if (SENT) return;
+    const agentMayResolve = $('agentResolveChk').checked;
     if (WAIT_TOKEN) {
       try {
-        await api('/api/handoff', 'POST', { token: WAIT_TOKEN });
+        await api('/api/handoff', 'POST', { token: WAIT_TOKEN, agentMayResolve });
         SENT = true;
         const btn = $('sendBtn');
         btn.textContent = 'Review sent ✓';
         btn.disabled = true;
         cancelComposer();
         document.querySelectorAll('[data-delstart]').forEach((b) => b.remove());
-        toast('Review sent — the agent will pick it up. You can close this tab.');
+        toast(
+          agentMayResolve
+            ? 'Review sent — the agent will pick it up. You can close this tab.'
+            : 'Review sent — the agent is told to leave threads open for you to resolve.'
+        );
       } catch (err) {
         toast('Handoff failed: ' + err.message);
       }
     } else {
       try {
-        await navigator.clipboard.writeText(buildReviewMarkdown());
+        await navigator.clipboard.writeText(buildReviewMarkdown(agentMayResolve));
         toast('No waiting agent (start with --wait). Review markdown copied to clipboard.');
       } catch {
         toast('Clipboard unavailable here — start the server with --wait to hand the review to the agent.');
@@ -2004,6 +2032,21 @@ function clientMain() {
   const savedSort = store('xd-lite-sort');
   if (['file', 'status', 'time', 'type'].includes(savedSort)) sortKey = savedSort;
   $('sortSel').value = sortKey;
+
+  // resolved remarks stay browsable unless the human hides them; and the
+  // human can forbid the agent from resolving on their behalf (goes into
+  // the REVIEW_FILE the agent reads after "Send review")
+  showResolved = store('xd-lite-show-resolved') !== '0';
+  $('showResolvedChk').checked = showResolved;
+  $('showResolvedChk').addEventListener('change', (e) => {
+    showResolved = e.target.checked;
+    store('xd-lite-show-resolved', showResolved ? '1' : '0');
+    renderSidebar();
+  });
+  $('agentResolveChk').checked = store('xd-lite-agent-resolve') !== '0';
+  $('agentResolveChk').addEventListener('change', (e) => {
+    store('xd-lite-agent-resolve', e.target.checked ? '1' : '0');
+  });
 
   // ------------------------------------------------------- diff source switcher
   // "Iterations" of the content: working tree / staged / last commit / whole
@@ -2190,6 +2233,11 @@ button { font-family: var(--ui-font); }
 .drag-handle:active { cursor: grabbing; }
 .panel-title { font-weight: 600; text-transform: uppercase; letter-spacing: .4px; font-size: 10px; }
 .panel-count { font-family: var(--code-font); font-size: 10px; color: var(--fg-subtle); }
+.panel-opt {
+  display: inline-flex; align-items: center; gap: 4px; cursor: pointer;
+  font-size: 10px; color: var(--fg-muted); white-space: nowrap; user-select: none;
+}
+.panel-opt input { accent-color: var(--accent); margin: 0; }
 .panel-scroll { flex: 1 1 0; min-height: 0; overflow-y: auto; }
 #commentList { padding: 4px 6px; }
 #tree { padding: 6px 6px 6px 0; }
@@ -2258,6 +2306,11 @@ body.resizing-v { cursor: row-resize; user-select: none; }
 .c-snip { font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 .side-foot { padding: 10px 12px 12px; border-top: 1px solid var(--border); }
+.foot-opt {
+  display: flex; align-items: center; gap: 6px; cursor: pointer; user-select: none;
+  font-size: 11px; color: var(--fg-muted); margin-bottom: 8px;
+}
+.foot-opt input { accent-color: var(--accent); margin: 0; }
 .foot-meta {
   display: flex; align-items: center; gap: 6px;
   font-size: 11px; color: var(--fg-muted); margin-bottom: 7px;
@@ -2356,6 +2409,7 @@ tr.hunk-head td.code, tr.meta-row td.code { color: var(--fg-subtle); padding-top
 .chip-human { color: var(--accent); background: color-mix(in srgb, var(--accent) 10%, transparent); }
 .chip-agent { color: var(--agent); background: color-mix(in srgb, var(--agent) 12%, transparent); }
 .t-time { font-size: 11px; color: var(--fg-subtle); }
+.t-resolvedby { font-size: 10.5px; font-weight: 600; color: var(--add-fg); white-space: nowrap; }
 .thread-body { font-size: 13px; line-height: 1.55; overflow-wrap: break-word; }
 .thread-body code, .reply-body code { font-family: var(--code-font); font-size: 12px; background: var(--bg-inset); padding: 1px 4px; border-radius: 4px; }
 .thread-body pre { background: var(--bg-inset); border: 1px solid var(--border-subtle); border-radius: 6px; padding: 8px 10px; overflow-x: auto; margin: 6px 0; }
@@ -2461,6 +2515,9 @@ tr.row.hb-hl td:not(.num):not(.sel) { background: var(--bg-subtle); }
           <span class="panel-title">Comments</span>
           <span class="panel-count" id="commentCount"></span>
           <span class="flex"></span>
+          <label class="panel-opt" title="Resolved remarks stay in this list (greyed) so you can always revisit them">
+            <input type="checkbox" id="showResolvedChk"> resolved
+          </label>
           <select id="sortSel" data-sort title="Sort comments">
             <option value="file">by file</option>
             <option value="status">by status</option>
@@ -2484,6 +2541,9 @@ tr.row.hb-hl td:not(.num):not(.sel) { background: var(--bg-subtle); }
       </section>
     </div>
     <div class="side-foot">
+      <label class="foot-opt" id="agentResolveOpt" title="When unchecked, the review file tells the agent to leave every thread open — you verify and resolve them yourself">
+        <input type="checkbox" id="agentResolveChk"> agent may resolve remarks
+      </label>
       <div class="foot-meta" id="footMeta"></div>
       <button id="sendBtn" class="send-btn">Send review to agent</button>
     </div>
@@ -2703,7 +2763,8 @@ async function startLiteServer({ repoPath, port = 0, source, author }) {
           return;
         }
         handoffResolvers.delete(body.token);
-        resolve();
+        // hand the human's resolution preference to the waiting CLI
+        resolve({ agentMayResolve: body?.agentMayResolve !== false });
         sendJson(res, 200, { ok: true });
         return;
       }
@@ -3066,14 +3127,16 @@ async function main() {
     // wait for the click, or bail out after --timeout minutes (hook safety)
     const timeoutMin = Number.parseFloat(flags.get('--timeout') ?? '');
     let timedOut = false;
+    let handoff = null; // { agentMayResolve } — the human's resolution preference
     if (Number.isFinite(timeoutMin) && timeoutMin > 0) {
       const winner = await Promise.race([
-        waitForHandoff(token).then(() => 'sent'),
-        new Promise((r) => setTimeout(() => r('timeout'), timeoutMin * 60_000)),
+        waitForHandoff(token).then((h) => ({ kind: 'sent', handoff: h })),
+        new Promise((r) => setTimeout(() => r({ kind: 'timeout' }), timeoutMin * 60_000)),
       ]);
-      timedOut = winner === 'timeout';
+      timedOut = winner.kind === 'timeout';
+      handoff = winner.handoff ?? null;
     } else {
-      await waitForHandoff(token);
+      handoff = await waitForHandoff(token);
     }
     if (timedOut) {
       console.log(`Timed out after ${timeoutMin} min — collecting current threads.`);
@@ -3084,7 +3147,10 @@ async function main() {
       flags.get('--out') ?? path.join(root, XD_DIR, `review-${new Date().toISOString().replace(/[:.]/g, '-')}.md`)
     );
     await mkdir(path.dirname(outPath), { recursive: true });
-    await writeFile(outPath, renderHandoff(root, threads), 'utf8');
+    await writeFile(outPath, renderHandoff(root, threads, handoff ?? undefined), 'utf8');
+    if (handoff && !handoff.agentMayResolve) {
+      console.log('Note: the human wants to resolve threads themselves — do not resolve, only reply.');
+    }
 
     console.log(timedOut ? 'Wait timed out — review collected as-is.' : 'Review received.');
     console.log(`REVIEW_FILE=${outPath}`);

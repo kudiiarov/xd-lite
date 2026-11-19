@@ -17,7 +17,10 @@ the wait. Comments are stored as `<repo>/.xd/threads/*.md` — plain markdown, r
 by humans, agents and MCP tools. In the window (v0.1.4): a **diff-source switcher**
 in the header — working tree / staged / last commit / whole branch, plus every commit
 on the branch as its own diff; in-place **edit** of your remarks (✎); expand/collapse
-**all context** (⤢) and a compact split/unified icon toggle. Gitignored files are
+**all context** (⤢) and a compact split/unified icon toggle. Resolved remarks stay
+visible (greyed, with who-resolved) behind a "resolved" filter, and the **"agent may
+resolve remarks"** checkbox (footer) lets you forbid the agent from resolving threads
+— the review file then instructs it to leave them open for you. Gitignored files are
 never shown.
 
 ---
@@ -45,6 +48,11 @@ xd-lite .                              # просто окно ревью (не 
 - **Контекст между ханками** — «⋯» раскрывает строки; кнопка `⤢` в тулбаре
   файла раскрывает весь контекст сразу (повторный клик сворачивает).
 - **Split/Unified** — иконка-переключатель рядом с `⤢`; тема — кнопка в шапке.
+- **Решённые не пропадают** — остаются в списке серыми с пометкой «✓ кто
+  закрыл»; чекбокс «resolved» в панели Comments их прячет.
+- **Кто решает** — настройка «agent may resolve remarks» в футере: если её
+  снять, в REVIEW_FILE попадает запрет агенту резолвить треды — он чинит,
+  отвечает и оставляет их открытыми для вас.
 - Ignored-файлы (`.gitignore`) не показываются никогда.
 
 ## Как это работает (`--wait`)
