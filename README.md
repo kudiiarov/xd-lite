@@ -15,9 +15,12 @@ exits 0 after the human clicks "Send review to agent"; `--fail-on-open` exits 2 
 open tasks remain (a PreToolUse hook can block `git push`); `--timeout MINUTES` stops
 the wait. Comments are stored as `<repo>/.xd/threads/*.md` — plain markdown, readable
 by humans, agents and MCP tools. In the window (v0.1.4): a **diff-source switcher**
-in the header — working tree / staged / last commit / whole branch, plus every commit
-on the branch as its own diff; in-place **edit** of your remarks (✎); expand/collapse
-**all context** (⤢) and a compact split/unified icon toggle. Resolved remarks stay
+in the header named after the questions you ask — **Uncommitted · not in PR yet**
+(what the agent just changed), **Staged · next commit**, **PR vs main · N commits**
+(exactly what the PR will contain — committed work only, `base...HEAD`), plus a
+**Commits on branch (N)** list with every commit as its own diff; the branch chip
+shows `↑N`. Also: in-place **edit** of your remarks (✎); expand/collapse **all
+context** (⤢) and a compact split/unified icon toggle. Resolved remarks stay
 visible (greyed, with who-resolved) behind a "resolved" filter, and the **"agent may
 resolve remarks"** checkbox (footer) lets you forbid the agent from resolving threads
 — the review file then instructs it to leave them open for you. Gitignored files are
@@ -37,10 +40,13 @@ xd-lite .                              # просто окно ревью (не 
 
 Что есть в окне (v0.1.4):
 
-- **Итерации контента** — селектор в шапке переключает дифф: working tree /
-  staged / последний коммит / весь бранч (vs base) + **каждый коммит ветки
-  отдельным диффом** (base — из `--vs`, иначе авто-детект: upstream →
-  `origin/main` → `main`). Выбор запоминается между перезагрузками.
+- **Итерации контента** — селектор в шапке, режимы названы по вопросам:
+  **Uncommitted · not in PR yet** (что агент изменил только что), **Staged ·
+  next commit**, **PR vs main · N commits** (что попадёт в PR — только
+  закоммиченное, `base...HEAD`) и **Commits on branch (N)** — каждый коммит
+  отдельным диффом. Base — из `--vs`, иначе авто-детект: upstream →
+  `origin/main` → `main`. В шапке рядом с веткой счётчик `↑N`. Выбор
+  запоминается между перезагрузками.
 - **Замечания**: пилюля **Task/Comment** под строкой открывает композер сразу
   с нужным типом; клик/shift-клик выбирает диапазон строк. У замечания есть
   ✎ (править текст) и ✕ (удалить) до отправки ревью; ответы агента видны

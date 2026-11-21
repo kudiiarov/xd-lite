@@ -168,7 +168,7 @@ test('lite server: health, diff, threads CRUD and handoff end-to-end', { skip: c
     assert.deepEqual(await (await fetch(`${url}/api/health`)).json(), { ok: true });
 
     const diff = await (await fetch(`${url}/api/diff`)).json();
-    assert.equal(diff.label, 'Working tree');
+    assert.equal(diff.label, 'Uncommitted');
     assert.match(diff.text, /a\.txt/);
     assert.match(diff.text, /new\.py/);
     assert.equal(diff.branch, 'main', 'current branch exposed for the header');
@@ -397,6 +397,17 @@ test('source switcher: /api/sources lists commits, ?src=commit:<sha> shows that 
     const dVs = await (await fetch(`${url}/api/diff?src=vs:HEAD~2`)).json();
     assert.match(dVs.text, /new\.py/);
     assert.match(dVs.text, /line five/, 'whole-branch diff combines all commits');
+
+    // PR semantics: vs base shows committed work only — uncommitted edits
+    // never reach a PR, so they must not leak into this mode
+    writeFileSync(path.join(dir, 'a.txt'), 'line one\nchanged two\nline three\nline four\nline five\nUNCOMMITTED edit\n');
+    const dVsFresh = await (await fetch(`${url}/api/diff?src=vs:HEAD~2`)).json();
+    assert.equal(dVsFresh.label, 'PR vs HEAD~2');
+    assert.doesNotMatch(dVsFresh.text, /UNCOMMITTED edit/, 'vs base is committed-only (PR view)');
+    const dWorking = await (await fetch(`${url}/api/diff?src=working`)).json();
+    assert.match(dWorking.text, /UNCOMMITTED edit/, 'uncommitted mode shows the fresh edit');
+    const blobVsOld = await (await fetch(`${url}/api/blob?path=a.txt&side=old&src=vs:HEAD~2`)).json();
+    assert.doesNotMatch(blobVsOld.text, /UNCOMMITTED edit/, 'vs old blob side is the merge-base, not the worktree');
 
     assert.equal((await fetch(`${url}/api/diff?src=bogus`)).status, 400);
     assert.equal((await fetch(`${url}/api/diff?src=commit:zzzz`)).status, 400);

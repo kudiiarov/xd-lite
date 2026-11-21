@@ -119,10 +119,10 @@ function parseSourceKey(key) {
 
 function diffSourceLabel(source) {
   switch (source.kind) {
-    case 'working': return 'Working tree';
+    case 'working': return 'Uncommitted';
     case 'staged': return 'Staged';
-    case 'head': return 'Latest commit';
-    case 'vs': return `vs ${source.base}`;
+    case 'head': return 'Last commit';
+    case 'vs': return `PR vs ${source.base}`;
     case 'commit': return `Commit ${String(source.sha).slice(0, 7)}`;
   }
 }
@@ -196,7 +196,9 @@ function baseArgs(source) {
     case 'working': return ['diff', 'HEAD'];
     case 'staged': return ['diff', '--cached', 'HEAD'];
     case 'head': return ['show', '--format=', '--root', 'HEAD'];
-    case 'vs': return ['diff', source.base];
+    // PR semantics: merge-base(base, HEAD)..HEAD — committed work only.
+    // Uncommitted changes are the "Uncommitted" mode, they never reach a PR.
+    case 'vs': return ['diff', `${source.base}...HEAD`];
     case 'commit': return ['show', '--format=', '--root', source.sha];
   }
 }
@@ -1454,7 +1456,11 @@ function clientMain() {
     const toolbar = $('toolbar');
     if (curFile == null || !FILES.length) {
       toolbar.innerHTML = '';
-      content.innerHTML = `<div class="empty">${FILES.length ? 'Select a file in the tree.' : 'No changes — <b>' + esc(LABEL) + '</b> is clean.'}</div>`;
+      content.innerHTML = `<div class="empty">${FILES.length
+        ? 'Select a file in the tree.'
+        : SRC_KEY === 'working'
+          ? 'Everything is committed — no uncommitted changes.<br>Switch the source to <b>PR</b> to see what the branch adds.'
+          : `Nothing to show — <b>${esc(LABEL)}</b> has no changes.`}</div>`;
       return;
     }
     const f = FILES[curFile];
@@ -2054,12 +2060,13 @@ function clientMain() {
   let SRC_KEY = null;
   let SRC_ITEMS = [];
   let SRC_COMMITS = [];
+  let SRC_BASE = null;
 
   function fillSrcSelect() {
     const opts = SRC_ITEMS.map((it) =>
       `<option value="${esc(it.key)}"${it.key === SRC_KEY ? ' selected' : ''}>${esc(it.label)}</option>`);
     if (SRC_COMMITS.length) {
-      opts.push('<optgroup label="Commits on branch">' + SRC_COMMITS.map((c) =>
+      opts.push(`<optgroup label="Commits on branch (${SRC_COMMITS.length})">` + SRC_COMMITS.map((c) =>
         `<option value="commit:${esc(c.sha)}"${`commit:${c.sha}` === SRC_KEY ? ' selected' : ''}>${esc(c.short)} ${esc(c.subject)}</option>`
       ).join('') + '</optgroup>');
     }
@@ -2075,7 +2082,11 @@ function clientMain() {
     EXPANDABLE = Boolean(d.expandable);
     FILES = parseDiff(d.text);
     curFile = FILES.length ? 0 : null;
-    $('branchName').textContent = BRANCH || '(no branch)';
+    const bn = $('branchName');
+    bn.textContent = (BRANCH || '(no branch)') + (SRC_COMMITS.length ? ` ↑${SRC_COMMITS.length}` : '');
+    bn.title = SRC_COMMITS.length
+      ? `${BRANCH} is ${SRC_COMMITS.length} commit${SRC_COMMITS.length === 1 ? '' : 's'} ahead of ${SRC_BASE || 'its base'} — this is what the PR will contain`
+      : 'current branch';
     $('loading').classList.add('hidden');
     renderAll(false);
     $('mainArea').scrollTop = 0;
@@ -2103,6 +2114,7 @@ function clientMain() {
     .then(async ([s, t]) => {
       SRC_ITEMS = s.items;
       SRC_COMMITS = s.commits || [];
+      SRC_BASE = s.base;
       THREADS = t.threads;
       const known = (k) => SRC_ITEMS.some((it) => it.key === k) ||
         SRC_COMMITS.some((c) => `commit:${c.sha}` === k);
@@ -2641,15 +2653,19 @@ async function startLiteServer({ repoPath, port = 0, source, author }) {
       if (req.method === 'GET' && pathname === '/api/sources') {
         const base = await detectBase(repoPath, source);
         const commits = await listCommits(repoPath, base);
+        const n = commits.length;
         sendJson(res, 200, {
           current: sourceKey(source),
           base,
           label,
           items: [
-            { key: 'working', label: 'Working tree' },
-            { key: 'staged', label: 'Staged' },
-            { key: 'head', label: 'Latest commit' },
-            ...(base ? [{ key: `vs:${base}`, label: `Whole branch (vs ${base})` }] : []),
+            { key: 'working', label: 'Uncommitted · not in PR yet' },
+            { key: 'staged', label: 'Staged · next commit' },
+            ...(base
+              ? [{ key: `vs:${base}`, label: `PR vs ${base} · ${n} commit${n === 1 ? '' : 's'}` }]
+              : []),
+            // 'head' stays a valid src key (CLI --source head) but the commits
+            // list below already contains it as the newest entry
           ],
           commits,
         });
@@ -2712,7 +2728,9 @@ async function startLiteServer({ repoPath, port = 0, source, author }) {
         } else if (blobSource.kind === 'working') {
           blob = await gitBlob(repoPath, 'HEAD', p);
         } else if (blobSource.kind === 'vs') {
-          blob = await gitBlob(repoPath, blobSource.base, p);
+          // old side of the PR diff is the merge-base, matching base...HEAD
+          const mb = await runGit(repoPath, ['merge-base', blobSource.base, 'HEAD']).catch(() => blobSource.base);
+          blob = await gitBlob(repoPath, mb.trim().split('\n')[0], p);
         } else if (blobSource.kind === 'commit') {
           const parent = await runGit(repoPath, ['rev-parse', `${blobSource.sha}^`]).catch(() => null);
           blob = parent ? await gitBlob(repoPath, parent, p) : { text: '' }; // root commit: all new
