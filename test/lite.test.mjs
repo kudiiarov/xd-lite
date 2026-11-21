@@ -414,6 +414,14 @@ test('source switcher: /api/sources lists commits, ?src=commit:<sha> shows that 
     assert.doesNotMatch(dVsFresh.text, /UNCOMMITTED edit/, 'vs base is committed-only (PR view)');
     const dWorking = await (await fetch(`${url}/api/diff?src=working`)).json();
     assert.match(dWorking.text, /UNCOMMITTED edit/, 'uncommitted mode shows the fresh edit');
+    // "All changes vs base" = everything the branch touches: commits + the
+    // uncommitted edit together
+    const dAll = await (await fetch(`${url}/api/diff?src=all:HEAD~2`)).json();
+    assert.equal(dAll.label, 'All changes vs HEAD~2');
+    assert.match(dAll.text, /line five/, 'committed work included');
+    assert.match(dAll.text, /UNCOMMITTED edit/, 'uncommitted edit included too');
+    const blobAllOld = await (await fetch(`${url}/api/blob?path=a.txt&side=old&src=all:HEAD~2`)).json();
+    assert.doesNotMatch(blobAllOld.text, /line five|UNCOMMITTED/, 'all old blob side is the base itself');
     const blobVsOld = await (await fetch(`${url}/api/blob?path=a.txt&side=old&src=vs:HEAD~2`)).json();
     assert.doesNotMatch(blobVsOld.text, /UNCOMMITTED edit/, 'vs old blob side is the merge-base, not the worktree');
 

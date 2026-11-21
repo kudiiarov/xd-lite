@@ -104,17 +104,21 @@ function resolveSource(flags) {
 
 function sourceKey(source) {
   if (source.kind === 'vs') return `vs:${source.base}`;
+  if (source.kind === 'all') return `all:${source.base}`;
   if (source.kind === 'commit') return `commit:${source.sha}`;
   return source.kind;
 }
 
-/** Inverse of sourceKey: "commit:<sha>" / "vs:<base>" / working|staged|head → source. */
+/** Inverse of sourceKey: "commit:<sha>" / "vs:<base>" / "all:<base>" /
+ *  working|staged|head → source. */
 function parseSourceKey(key) {
   if (key === 'working' || key === 'staged' || key === 'head') return { kind: key };
-  const m = String(key || '').match(/^(vs|commit):(.+)$/);
+  const m = String(key || '').match(/^(vs|all|commit):(.+)$/);
   if (!m || !m[2] || m[2].includes('..') || /[\s;&|`$]/.test(m[2])) return null;
   if (m[1] === 'commit' && !/^[0-9a-f]{7,40}$/i.test(m[2])) return null; // commit names are hex shas
-  return m[1] === 'vs' ? { kind: 'vs', base: m[2] } : { kind: 'commit', sha: m[2] };
+  return m[1] === 'vs' ? { kind: 'vs', base: m[2] }
+    : m[1] === 'all' ? { kind: 'all', base: m[2] }
+    : { kind: 'commit', sha: m[2] };
 }
 
 function diffSourceLabel(source) {
@@ -123,6 +127,7 @@ function diffSourceLabel(source) {
     case 'staged': return 'Staged';
     case 'head': return 'Last commit';
     case 'vs': return `PR vs ${source.base}`;
+    case 'all': return `All changes vs ${source.base}`;
     case 'commit': return `Commit ${String(source.sha).slice(0, 7)}`;
   }
 }
@@ -215,6 +220,9 @@ function baseArgs(source) {
     // PR semantics: merge-base(base, HEAD)..HEAD — committed work only.
     // Uncommitted changes are the "Uncommitted" mode, they never reach a PR.
     case 'vs': return ['diff', `${source.base}...HEAD`];
+    // everything the branch touches: commits + uncommitted + untracked,
+    // base vs working tree
+    case 'all': return ['diff', source.base];
     case 'commit': return ['show', '--format=', '--root', source.sha];
   }
 }
@@ -231,7 +239,8 @@ async function getDiffText(worktreePath, source) {
     throw err;
   }
   // Working-tree diffs miss untracked files; append synthesized "new file" diffs.
-  if (source.kind === 'working') {
+  // The 'all' mode (base vs working tree) counts untracked files as edits too.
+  if (source.kind === 'working' || source.kind === 'all') {
     const untracked = await listUntracked(worktreePath);
     for (const file of untracked) {
       text += `\n${await synthNewFileDiff(worktreePath, file)}`;
@@ -2678,7 +2687,10 @@ async function startLiteServer({ repoPath, port = 0, source, author }) {
           { key: 'working', label: 'Uncommitted · not in PR yet' },
           ...(await hasStaged(repoPath) ? [{ key: 'staged', label: 'Staged · next commit' }] : []),
           ...(base
-            ? [{ key: `vs:${base}`, label: `PR vs ${base} · ${n} commit${n === 1 ? '' : 's'}` }]
+            ? [
+                { key: `vs:${base}`, label: `PR vs ${base} · ${n} commit${n === 1 ? '' : 's'}` },
+                { key: `all:${base}`, label: `All changes vs ${base}` },
+              ]
             : []),
           // 'head' stays a valid src key (CLI --source head) but the commits
           // list below already contains it as the newest entry
@@ -2762,6 +2774,9 @@ async function startLiteServer({ repoPath, port = 0, source, author }) {
           // old side of the PR diff is the merge-base, matching base...HEAD
           const mb = await runGit(repoPath, ['merge-base', blobSource.base, 'HEAD']).catch(() => blobSource.base);
           blob = await gitBlob(repoPath, mb.trim().split('\n')[0], p);
+        } else if (blobSource.kind === 'all') {
+          // old side of "everything vs base" is the base itself
+          blob = await gitBlob(repoPath, blobSource.base, p);
         } else if (blobSource.kind === 'commit') {
           const parent = await runGit(repoPath, ['rev-parse', `${blobSource.sha}^`]).catch(() => null);
           blob = parent ? await gitBlob(repoPath, parent, p) : { text: '' }; // root commit: all new
