@@ -174,6 +174,13 @@ test('lite server: health, diff, threads CRUD and handoff end-to-end', { skip: c
     assert.equal(diff.branch, 'main', 'current branch exposed for the header');
     assert.equal(diff.expandable, true, 'working mode supports context expansion');
 
+    // sources: single-branch repo → no base → no PR mode, no staged entry
+    // (nothing staged), but recent history stays browsable
+    const src1 = await (await fetch(`${url}/api/sources`)).json();
+    assert.deepEqual(src1.items.map((it) => it.key), ['working'], 'empty Staged is hidden, no base → no PR entry');
+    assert.equal(src1.commitsLabel, 'Recent commits (1)');
+    assert.equal(src1.commits[0].subject, 'init');
+
     // blob endpoint for context expansion: new = worktree, old = HEAD
     const blobNew = await (await fetch(`${url}/api/blob?path=a.txt&side=new`)).json();
     assert.match(blobNew.text, /changed two/);
@@ -377,6 +384,7 @@ test('source switcher: /api/sources lists commits, ?src=commit:<sha> shows that 
     assert.equal(src.base, 'HEAD~2');
     assert.ok(src.items.some((it) => it.key === 'vs:HEAD~2'), 'whole-branch entry present');
     assert.equal(src.commits.length, 2, 'both branch commits listed');
+    assert.equal(src.commitsLabel, 'Commits on branch (2)');
     assert.equal(src.commits[0].subject, 'third: five');
     assert.equal(src.commits[1].subject, 'second: everything so far');
     const third = src.commits[0].sha;

@@ -144,14 +144,30 @@ async function detectBase(worktreePath, source) {
 /** Commits on the branch (base..HEAD), newest first — the "iterations" list. */
 async function listCommits(worktreePath, base) {
   if (!base) return [];
-  const out = await runGit(worktreePath, [
+  return parseCommitLog(await runGit(worktreePath, [
     'log', '--format=%H%x1f%h%x1f%s%x1f%an%x1f%at', `${base}..HEAD`,
-  ]).catch(() => '');
+  ]).catch(() => ''));
+}
+
+/** Recent history when no base exists (single-branch repo): last n commits. */
+async function listRecentCommits(worktreePath, n) {
+  return parseCommitLog(await runGit(worktreePath, [
+    'log', `-n${n}`, '--format=%H%x1f%h%x1f%s%x1f%an%x1f%at', 'HEAD',
+  ]).catch(() => ''));
+}
+
+function parseCommitLog(out) {
   if (!out) return [];
   return out.split('\n').filter(Boolean).map((line) => {
     const [sha, short, subject, author, at] = line.split('\x1f');
     return { sha, short, subject, author, at: Number(at) * 1000 };
   });
+}
+
+/** True when something is staged (an empty Staged mode is just noise). */
+async function hasStaged(worktreePath) {
+  const out = await runGit(worktreePath, ['diff', '--cached', '--name-only']).catch(() => '');
+  return Boolean(out);
 }
 
 // ============================================================================
@@ -2060,13 +2076,14 @@ function clientMain() {
   let SRC_KEY = null;
   let SRC_ITEMS = [];
   let SRC_COMMITS = [];
+  let SRC_COMMITS_LABEL = '';
   let SRC_BASE = null;
 
   function fillSrcSelect() {
     const opts = SRC_ITEMS.map((it) =>
       `<option value="${esc(it.key)}"${it.key === SRC_KEY ? ' selected' : ''}>${esc(it.label)}</option>`);
     if (SRC_COMMITS.length) {
-      opts.push(`<optgroup label="Commits on branch (${SRC_COMMITS.length})">` + SRC_COMMITS.map((c) =>
+      opts.push(`<optgroup label="${esc(SRC_COMMITS_LABEL)}">` + SRC_COMMITS.map((c) =>
         `<option value="commit:${esc(c.sha)}"${`commit:${c.sha}` === SRC_KEY ? ' selected' : ''}>${esc(c.short)} ${esc(c.subject)}</option>`
       ).join('') + '</optgroup>');
     }
@@ -2082,10 +2099,12 @@ function clientMain() {
     EXPANDABLE = Boolean(d.expandable);
     FILES = parseDiff(d.text);
     curFile = FILES.length ? 0 : null;
+    // ↑N only counts commits ahead of a known base — those are the PR contents
+    const ahead = SRC_BASE ? SRC_COMMITS.length : 0;
     const bn = $('branchName');
-    bn.textContent = (BRANCH || '(no branch)') + (SRC_COMMITS.length ? ` ↑${SRC_COMMITS.length}` : '');
-    bn.title = SRC_COMMITS.length
-      ? `${BRANCH} is ${SRC_COMMITS.length} commit${SRC_COMMITS.length === 1 ? '' : 's'} ahead of ${SRC_BASE || 'its base'} — this is what the PR will contain`
+    bn.textContent = (BRANCH || '(no branch)') + (ahead ? ` ↑${ahead}` : '');
+    bn.title = ahead
+      ? `${BRANCH} is ${ahead} commit${ahead === 1 ? '' : 's'} ahead of ${SRC_BASE} — this is what the PR will contain`
       : 'current branch';
     $('loading').classList.add('hidden');
     renderAll(false);
@@ -2114,6 +2133,7 @@ function clientMain() {
     .then(async ([s, t]) => {
       SRC_ITEMS = s.items;
       SRC_COMMITS = s.commits || [];
+      SRC_COMMITS_LABEL = s.commitsLabel || 'Commits';
       SRC_BASE = s.base;
       THREADS = t.threads;
       const known = (k) => SRC_ITEMS.some((it) => it.key === k) ||
@@ -2652,22 +2672,33 @@ async function startLiteServer({ repoPath, port = 0, source, author }) {
       }
       if (req.method === 'GET' && pathname === '/api/sources') {
         const base = await detectBase(repoPath, source);
-        const commits = await listCommits(repoPath, base);
+        let commits = await listCommits(repoPath, base);
         const n = commits.length;
+        const items = [
+          { key: 'working', label: 'Uncommitted · not in PR yet' },
+          ...(await hasStaged(repoPath) ? [{ key: 'staged', label: 'Staged · next commit' }] : []),
+          ...(base
+            ? [{ key: `vs:${base}`, label: `PR vs ${base} · ${n} commit${n === 1 ? '' : 's'}` }]
+            : []),
+          // 'head' stays a valid src key (CLI --source head) but the commits
+          // list below already contains it as the newest entry
+        ];
+        // without a base (single-branch repo) there is no "branch vs base" —
+        // recent history keeps the committed work browsable instead
+        let commitsLabel;
+        if (base) {
+          commitsLabel = `Commits on branch (${n})`;
+        } else {
+          commits = await listRecentCommits(repoPath, 10);
+          commitsLabel = `Recent commits (${commits.length})`;
+        }
         sendJson(res, 200, {
           current: sourceKey(source),
           base,
           label,
-          items: [
-            { key: 'working', label: 'Uncommitted · not in PR yet' },
-            { key: 'staged', label: 'Staged · next commit' },
-            ...(base
-              ? [{ key: `vs:${base}`, label: `PR vs ${base} · ${n} commit${n === 1 ? '' : 's'}` }]
-              : []),
-            // 'head' stays a valid src key (CLI --source head) but the commits
-            // list below already contains it as the newest entry
-          ],
+          items,
           commits,
+          commitsLabel,
         });
         return;
       }
